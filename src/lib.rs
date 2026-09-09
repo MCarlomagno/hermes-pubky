@@ -9,10 +9,14 @@
 // Modules are public so the e2e suite can drive the real code paths against
 // a live testnet; only the `#[pymodule]` surface below is exposed to Python.
 pub mod auth;
+pub mod bindings;
 pub mod errors;
 pub mod http;
+pub mod objects;
+pub mod roots;
 pub mod runtime;
 pub mod session;
+pub mod storage;
 pub mod urls;
 
 use pyo3::prelude::*;
@@ -64,6 +68,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     m.add_class::<auth::AuthFlow>()?;
     m.add_class::<session::Session>()?;
+    m.add_class::<bindings::AgentTransport>()?;
+    m.add_class::<bindings::PublicTemplate>()?;
+    m.add_class::<bindings::TemplatePublisher>()?;
 
     m.add_function(wrap_pyfunction!(session::public_get, m)?)?;
     m.add_function(wrap_pyfunction!(auth::required_capability, m)?)?;
@@ -72,5 +79,13 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_context_url, m)?)?;
     m.add_function(wrap_pyfunction!(validate_profile_id, m)?)?;
     m.add_function(wrap_pyfunction!(profile_path, m)?)?;
+    m.add_function(wrap_pyfunction!(bindings::agent_uri, m)?)?;
+    m.add_function(wrap_pyfunction!(bindings::agent_capability, m)?)?;
+    m.add_function(wrap_pyfunction!(bindings::parse_agent_uri, m)?)?;
+    m.add_function(wrap_pyfunction!(bindings::template_uri, m)?)?;
+    m.add_function(wrap_pyfunction!(bindings::template_capability, m)?)?;
+    m.add_function(wrap_pyfunction!(bindings::parse_template_uri, m)?)?;
+    m.add("PROTOCOL_VERSION", roots::PROTOCOL_VERSION)?;
+    m.add("MAX_OBJECT_BYTES", roots::MAX_OBJECT_BYTES)?;
     Ok(())
 }

@@ -77,3 +77,60 @@ group exists but routes through a `PluginContext` that has no
 `register_memory_provider`, so a pip install alone cannot deliver a memory
 provider. `hermes-pubky install` writes three small files that import the
 pip-installed package; upgrading the package needs no shim change.
+
+## Storage schema (0.1)
+
+### Public base context
+
+```text
+pubky://<author>/pub/hermes.pubky.app/v1/contexts/<context-id>.json
+```
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "researcher",
+  "name": "Researcher",
+  "description": "Research-oriented agent instructions",
+  "instructions": "Markdown instructions"
+}
+```
+
+Must be under `/pub/` and end in `.json`. v0.1 reads public contexts; it does
+not publish them.
+
+### Private profile
+
+```text
+/priv/hermes.pubky.app/v1/profiles/<profile-id>.json
+```
+
+```json
+{
+  "schemaVersion": 1,
+  "profileId": "default",
+  "baseContext": {
+    "url": "pubky://.../context.json",
+    "sha256": "approved-raw-content-hash"
+  },
+  "user": ["portable user fact"],
+  "memory": ["portable agent memory"],
+  "revision": 1,
+  "updatedAt": "RFC3339 timestamp"
+}
+```
+
+### Local files
+
+```text
+$HERMES_HOME/.env                                 HERMES_PUBKY_GRANT_SECRET (0600)
+$HERMES_HOME/pubky/<profile-id>/profile.json      cached private profile
+$HERMES_HOME/pubky/<profile-id>/context.json      approved base context, raw bytes
+$HERMES_HOME/pubky/<profile-id>/context.meta.json its URL, hash and approval time
+$HERMES_HOME/pubky/<profile-id>/outbox.jsonl      writes not yet mirrored
+$HERMES_HOME/pubky/<profile-id>/state.json        last synced revision, conflict flag
+$HERMES_HOME/pubky/<profile-id>/backups/          discarded sides of conflicts
+```
+
+All of it lives under `HERMES_HOME`, so `hermes backup` already captures it.
+

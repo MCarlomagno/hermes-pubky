@@ -1,22 +1,32 @@
 # hermes-pubky
 
-Portable [Hermes](https://github.com/NousResearch/hermes) agent context over
-[Pubky](https://github.com/pubky/pubky-core).
+Keep a [Hermes](https://github.com/NousResearch/hermes) agent's context on your own
+[Pubky](https://github.com/pubky/pubky-core) homeserver instead of on one laptop.
 
-Your agent's context stops living on one machine. `hermes-pubky` adds a Hermes
-memory provider named `pubky` that loads:
+> **0.1, alpha.** A 0.2 rewrite is specified in the
+> [implementation plan](docs/IMPLEMENTATION-PLAN.md) and the pinned
+> [Hermes integration record](docs/HERMES-COMPATIBILITY.md). It replaces 0.1
+> outright, with no migration path. Everything below describes 0.1, which is
+> what ships today.
 
-- **a public base context** you explicitly approved — shareable agent
-  instructions addressed by a `pubky://` URL, and
-- **a private portable overlay** — your own user facts and agent memory, stored
-  in a private document on your homeserver and updated as Hermes writes memory.
+## Why
 
-Your local `SOUL.md`, `USER.md` and `MEMORY.md` are untouched and still take
-precedence. The plugin only ever *reads* them.
+Hermes stores what it knows about you in `SOUL.md`, `USER.md` and `MEMORY.md` on
+one machine. New laptop, fresh container, throwaway VM: the agent starts from
+nothing. The usual alternative is a memory SaaS, which makes your agent portable
+by moving it into someone else's account.
 
-> **Status: v0.1, alpha.** Homeserver `/priv` storage is itself alpha. See
-> [What the homeserver operator can see](#what-the-homeserver-operator-can-see)
-> before storing anything sensitive.
+This adds a third option. A memory provider named `pubky` keeps two things in
+documents addressed by your own keypair:
+
+- a **private overlay** of your user facts and agent memory, updated whenever
+  Hermes writes memory
+- a **public base context**, shareable agent instructions at a `pubky://` URL,
+  pinned by hash so its author cannot change your agent's instructions after you
+  approve them
+
+Your local `SOUL.md`, `USER.md` and `MEMORY.md` are read, never written, and
+still take precedence over anything the plugin injects.
 
 ## Install
 
@@ -27,178 +37,74 @@ hermes-pubky install
 hermes memory setup pubky
 ```
 
-`hermes-pubky install` writes a three-file shim into
-`$HERMES_HOME/plugins/pubky/`. Hermes discovers memory providers by scanning
-that directory rather than through Python entry points, so a pip install alone
-does not make the provider visible. The shim just imports the pip-installed
-package, so upgrades are a plain `uv pip install -U hermes-pubky`.
+Needs Python 3.11–3.13, Hermes 0.19, and a Pubky homeserver on v0.11 or later.
 
-Requires Python 3.11–3.13, Hermes 0.19+, and a Pubky homeserver running v0.11
-or later.
+`hermes-pubky install` writes a three-file shim to `$HERMES_HOME/plugins/pubky/`.
+Hermes finds memory providers by scanning that directory rather than through
+Python entry points, so a pip install alone leaves the provider invisible. The
+shim imports the installed package, so upgrading is `uv pip install -U
+hermes-pubky`.
 
-### Setup walks you through
-
-1. A profile id (default: `default`).
-2. Pubky Auth — an authorization URL you approve in [Pubky
-   Ring](https://pubky.org). The grant secret is stored in your
-   profile-scoped `.env` at mode `0600` and never leaves your machine.
-3. Loading your existing remote profile, or creating one.
-4. For a new profile: optionally pinning a public base context, and optionally
-   importing your existing `USER.md` / `MEMORY.md`. Filenames, entry counts and
-   sizes are shown before anything is copied, and the local files are never
-   modified.
-5. Activating `memory.provider: pubky`.
+Setup asks for a profile id, opens a [Pubky Ring](https://pubky.org)
+authorization URL, then offers to pin a public base context and to import your
+existing `USER.md` / `MEMORY.md`. It prints filenames, entry counts and sizes
+before copying anything, and never modifies the local files. The grant secret
+goes to your profile-scoped `.env` at mode `0600` and stays on the machine.
 
 ## Commands
 
 ```text
-hermes pubky status                  # grant, cache, revision, pending writes
-hermes pubky status --offline        # skip the homeserver check
-hermes pubky login                   # authorize this machine
-hermes pubky logout                  # revoke the grant, delete the local secret
-hermes pubky sync                    # reconcile pending writes
-hermes pubky sync --prefer remote    # resolve a conflict, keeping the remote
-hermes pubky sync --prefer local     # resolve a conflict, keeping local writes
-hermes pubky base set <pubky-url>    # pin a public base context
-hermes pubky base refresh            # re-approve it after its content changed
-hermes pubky base clear              # unpin it
+hermes pubky status [--offline]     grant, cache, revision, pending writes
+hermes pubky login                  authorize this machine
+hermes pubky logout                 revoke the grant, delete the local secret
+hermes pubky sync                   reconcile pending writes
+hermes pubky sync --prefer remote   on conflict, keep the remote profile
+hermes pubky sync --prefer local    on conflict, keep this machine's
+hermes pubky base set <pubky-url>   pin a public base context
+hermes pubky base refresh           re-approve it after the author changed it
+hermes pubky base clear             unpin it
 ```
 
-## Requested capabilities
+## What it can reach
 
-Setup requests exactly one capability:
+Setup requests one capability:
 
 ```text
 /priv/hermes.pubky.app/v1/profiles/:rw
 ```
 
-Read and write, confined to this plugin's own private profile directory. It
-cannot read your other apps' data, cannot write anywhere else, and does not
-hold the root capability. The plugin also refuses locally — before any request
-is sent — to touch a path outside that directory.
+Read and write inside its own directory. It holds no root capability and cannot
+read your other apps' data. The plugin also rejects paths outside that directory
+locally, before a request leaves the process. `logout` revokes the grant at the
+homeserver through the session's own `DELETE /auth/grant/session`.
 
-`hermes pubky logout` revokes the grant through the session's own
-`DELETE /auth/grant/session`, which a scoped grant is permitted to call.
+## Read this before you store anything
 
-## What the homeserver operator can see
+Your homeserver operator can read the overlay. `/priv` is access-controlled, not
+encrypted. If you self-host, that operator is you; otherwise assume whoever runs
+your homeserver can read it, and keep sensitive facts in your local `USER.md`.
+Credentials, conversations and tool results are never stored.
 
-`/priv` is **access-controlled, not encrypted**. Your homeserver operator can
-read the contents of your private profile document. If you self-host, that is
-you. If you do not, treat the portable overlay as visible to whoever runs your
-homeserver, and keep genuinely sensitive facts in your local `USER.md`
-instead — the plugin never uploads local files unless you explicitly import
-them during setup.
+One writer per profile. Read from as many machines as you like. If the remote
+revision moves while local writes are pending, syncing stops and asks you to
+pick a side with `--prefer`. Whichever side you drop is written to
+`$HERMES_HOME/pubky/<profile-id>/backups/` first.
 
-Never stored in either document: credentials, conversations, or tool results.
+Offline is the normal case. Startup reads the local cache, then refreshes with a
+five-second budget. Memory writes queue in a local outbox, survive restarts, and
+retry with backoff capped at 60 seconds. The injected prompt block says when it
+is working from a stale cache.
 
-## Offline behavior
+Small by design. 64 KiB per document, 4,000 characters per entry, 200 entries
+each for `user` and `memory`. A download is cut off mid-stream past the cap
+whatever the server claims in `Content-Length`.
 
-The plugin is designed to be used on a laptop that is frequently offline.
+Not in 0.1: publishing public contexts, semantic retrieval, session archives,
+credential storage, Windows wheels, and multi-writer merge. The provider exposes
+no tools and performs no recall.
 
-- **Startup** reads the profile-scoped cache first, then refreshes from the
-  homeserver with a five-second budget. If the network is slow or down, Hermes
-  starts on the cache and the refresh finishes in the background.
-- **Memory writes** are appended to a local JSONL outbox and mirrored to the
-  homeserver asynchronously. They never block a turn.
-- **Pending writes survive restarts** and retry with exponential backoff capped
-  at 60 seconds.
-- The injected prompt block says when it is working from a stale cache.
-
-## Conflict recovery
-
-v0.1 supports **one active writer per profile**. Reading the same profile from
-several machines is fine; writing from two at once is not supported.
-
-If the remote profile's revision changes while local writes are still pending,
-automatic syncing stops and the plugin asks you to choose:
-
-```bash
-hermes pubky sync --prefer remote   # keep the remote profile, drop local writes
-hermes pubky sync --prefer local    # keep this machine's profile, drop the remote
-```
-
-The two are symmetric: whichever side you drop is written to
-`$HERMES_HOME/pubky/<profile-id>/backups/` first, as JSON you can read and
-copy from. `--prefer remote` backs up both the cached local profile and the
-queued writes; `--prefer local` backs up the remote profile. A base context
-pinned only on the remote is carried over rather than lost.
-
-## Base context pinning
-
-A base context is pinned by the SHA-256 of its **raw bytes** at the moment you
-approve it. If the author later changes the document, the plugin keeps using
-the approved copy and logs a warning; the new content is only adopted after you
-review it with `hermes pubky base refresh`. This means someone whose context
-you follow cannot silently change your agent's instructions.
-
-## Storage schema
-
-### Public base context
-
-```text
-pubky://<author>/pub/hermes.pubky.app/v1/contexts/<context-id>.json
-```
-
-```json
-{
-  "schemaVersion": 1,
-  "id": "researcher",
-  "name": "Researcher",
-  "description": "Research-oriented agent instructions",
-  "instructions": "Markdown instructions"
-}
-```
-
-Must be under `/pub/` and end in `.json`. v0.1 reads public contexts; it does
-not publish them.
-
-### Private profile
-
-```text
-/priv/hermes.pubky.app/v1/profiles/<profile-id>.json
-```
-
-```json
-{
-  "schemaVersion": 1,
-  "profileId": "default",
-  "baseContext": {
-    "url": "pubky://.../context.json",
-    "sha256": "approved-raw-content-hash"
-  },
-  "user": ["portable user fact"],
-  "memory": ["portable agent memory"],
-  "revision": 1,
-  "updatedAt": "RFC3339 timestamp"
-}
-```
-
-### Local files
-
-```text
-$HERMES_HOME/.env                                 HERMES_PUBKY_GRANT_SECRET (0600)
-$HERMES_HOME/pubky/<profile-id>/profile.json      cached private profile
-$HERMES_HOME/pubky/<profile-id>/context.json      approved base context, raw bytes
-$HERMES_HOME/pubky/<profile-id>/context.meta.json its URL, hash and approval time
-$HERMES_HOME/pubky/<profile-id>/outbox.jsonl      writes not yet mirrored
-$HERMES_HOME/pubky/<profile-id>/state.json        last synced revision, conflict flag
-$HERMES_HOME/pubky/<profile-id>/backups/          discarded sides of conflicts
-```
-
-All of it lives under `HERMES_HOME`, so `hermes backup` already captures it.
-
-## Limits
-
-Documents are capped at 64 KiB, entries at 4,000 characters, and each of
-`user` / `memory` at 200 entries. Downloads are cut off mid-stream if a server
-exceeds the cap, whatever its `Content-Length` says.
-
-## Not in v0.1
-
-Publishing public contexts, semantic retrieval, chat/session archives,
-credential storage, Windows wheels, and multi-writer merge. The provider
-exposes no tools and performs no recall — it is a context provider, not a
-semantic-memory backend.
+The storage schema is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the
+threat model is in [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Development
 
@@ -207,11 +113,11 @@ uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python maturin pytest pyyaml
 PYO3_PYTHON="$PWD/.venv/bin/python" .venv/bin/maturin develop
 
-.venv/bin/pytest        # Python tests — no network, no homeserver
+.venv/bin/pytest        # Python tests, no network or homeserver needed
 cargo test --lib        # Rust unit tests
 ```
 
-The end-to-end suite runs against a real Pubky v0.11 testnet, which needs a
+The end-to-end suite runs against a real Pubky v0.11 testnet, so it needs
 PostgreSQL for the homeserver and the well-known testnet ports free:
 
 ```bash
@@ -223,14 +129,14 @@ export TEST_PUBKY_CONNECTION_STRING="postgres://test_user:test_pass@localhost:54
 cargo test --test e2e -- --ignored --test-threads=1
 ```
 
-They are `#[ignore]`d and single-threaded because the static testnet binds
-fixed ports — stop any `testnet_fixture` before running them.
+Those tests are `#[ignore]`d and single-threaded because the static testnet binds
+fixed ports. Stop any running `testnet_fixture` first.
 
-To exercise the Hermes-facing flows by hand, start a testnet with a
-pre-authorized grant and drive the real CLI against it:
+To drive the real CLI by hand, start a testnet that prints a pre-authorized
+grant:
 
 ```bash
-cargo run --example testnet_fixture          # prints the grant secret as JSON
+cargo run --example testnet_fixture
 ```
 
 ```bash
@@ -239,14 +145,14 @@ export HERMES_PUBKY_GRANT_SECRET="<grant_secret from the JSON>"
 hermes-pubky install && hermes memory setup pubky
 ```
 
-There is also a scripted version of that check:
+A scripted version of the same check:
 
 ```bash
 HERMES_HOME=/tmp/hermes-home python scripts/check_hermes_integration.py
 ```
 
 The Pubky Rust SDK is pinned to the v0.11.0 commit
-`6a14bdb8fa2e30ef4e4b241fcdd3992c453d2378` and `Cargo.lock` is committed.
+`6a14bdb8fa2e30ef4e4b241fcdd3992c453d2378`, and `Cargo.lock` is committed.
 
 ## License
 
