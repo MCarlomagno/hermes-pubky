@@ -42,9 +42,10 @@ with OIDC. Create the publisher **before** tagging:
    - Repository name: `hermes-pubky-memory`
    - Workflow name: `release.yml`
    - Environment name: `pypi`
-3. In the GitHub repo, create an environment named `pypi`
-   (Settings → Environments → New environment). Add a required reviewer if you
-   want a manual gate before each publish.
+3. The `pypi` environment does **not** need to exist first — Actions creates
+   it on first use, and the OIDC token carries the name either way. Create it
+   yourself (Settings → Environments → New environment, named `pypi`) only if
+   you want a required reviewer as a manual gate before each publish.
 
 ## 4. Tag the release
 
