@@ -57,6 +57,12 @@ def main() -> int:
                  "sync", "templates"):
         importlib.import_module(f"hermes_pubky.{name}")
 
+    # Declared runtime dependencies must be resolvable in a Hermes-free
+    # install; the config writer has no fallback if pyyaml is absent.
+    import yaml
+
+    assert yaml.safe_load(yaml.safe_dump({"model": "x"})) == {"model": "x"}
+
     from hermes_pubky import cli, models, provider
 
     assert cli.build_parser() is not None

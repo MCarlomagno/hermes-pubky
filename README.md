@@ -2,10 +2,7 @@
 
 Run a [Hermes](https://github.com/NousResearch/hermes) agent whose saved state
 lives on your own [Pubky](https://github.com/pubky/pubky-core) homeserver. The
-laptop becomes a working copy; the agent belongs to you.
-
-> **0.2.0 alpha.** This replaces the 0.1 memory-overlay plugin outright. There
-> is no migration: 0.1 data and commands are unsupported, and left untouched.
+laptop becomes a working copy, but the agent belongs to you.
 
 ## Why
 
@@ -16,7 +13,7 @@ alternative is a memory SaaS, which makes your agent portable by moving it into
 someone else's account.
 
 This is a third option. The homeserver holds the authoritative copy of the
-agent; a local Hermes reconstructs a working copy, runs it, and saves changes
+agent, a local Hermes reconstructs a working copy, runs it, and saves changes
 back. What travels:
 
 - instructions (`SOUL.md`), user and agent memories
@@ -95,7 +92,7 @@ agent's grant can never publish.
 ## Read this before you store anything
 
 Your homeserver operator can read your agent. `/priv` is access-controlled, not
-encrypted. If you self-host, that operator is you; otherwise assume whoever runs
+encrypted. If you self-host, that operator is you, otherwise assume whoever runs
 your homeserver can read your instructions, memories and conversations.
 Credentials are never uploaded, but a conversation can contain anything you or a
 tool put in it.

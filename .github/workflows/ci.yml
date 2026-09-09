@@ -82,12 +82,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Build and install the wheel
-        # Installing the built wheel means the tests exercise the shipped
-        # artifact, not the source tree.
+        # Installing the built wheel by path means the tests exercise the
+        # shipped artifact, not the source tree and not a PyPI release, while
+        # its declared dependencies still resolve normally.
         run: |
           uv pip install --system maturin pytest
           maturin build --release --out dist
-          uv pip install --system --no-index --find-links dist hermes-pubky
+          uv pip install --system dist/*.whl
       - run: python scripts/smoke_test.py
       - run: pytest -q
 
@@ -107,7 +108,7 @@ jobs:
         run: |
           uv pip install --system maturin pytest "hermes-agent==${HERMES_VERSION}"
           maturin build --release --out dist
-          uv pip install --system --no-index --find-links dist hermes-pubky
+          uv pip install --system dist/*.whl
       - name: Upstream contract and conversation fixtures
         run: pytest tests/test_hermes_contract.py tests/test_database.py -q
       - name: Launch a real managed Hermes turn
@@ -145,7 +146,11 @@ jobs:
         run: |
           uv pip install --system maturin "hermes-agent==${HERMES_VERSION}"
           maturin build --release --out dist
-          uv pip install --system --no-index --find-links dist hermes-pubky
+          uv pip install --system dist/*.whl
+      - name: Build the testnet fixture
+        # Separate step: compiling the homeserver takes longer than any
+        # sensible startup timeout, so it must not run inside one.
+        run: cargo build --release --example testnet_fixture
       - name: Start a testnet with pre-authorized grants
         run: |
           cargo run --release --example testnet_fixture > /tmp/fixture.json 2> /tmp/fixture.err &
