@@ -1,3 +1,0 @@
-# Store managed agent state on the homeserver and materialize a dedicated Hermes profile
-
-The portable-agent design requires recovery without the original computer, while Hermes reads local context, skills, configuration, and conversation state before or outside memory-provider hooks. The 0.2 design uses a launcher to reconstruct a dedicated local profile from homeserver checkpoints and an in-process plugin to notify its supervisor of changes. The working copy remains durable while unsynchronized; this trades some local storage and startup orchestration for compatibility with unmodified Hermes and a clear ownership boundary.

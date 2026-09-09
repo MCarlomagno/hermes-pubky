@@ -182,6 +182,21 @@ impl fmt::Display for Root {
     }
 }
 
+/// The capability string for an agent id, independent of any owner.
+///
+/// A capability names a path, not an identity, so this is well defined before
+/// the user has authorized anything.
+pub fn agent_scope(agent_id: &str) -> NativeResult<String> {
+    let id = validate_id(agent_id)?;
+    Ok(format!("{PRIVATE_PREFIX}{id}/:rw"))
+}
+
+/// The capability string for publishing a template id.
+pub fn template_scope(template_id: &str) -> NativeResult<String> {
+    let id = validate_id(template_id)?;
+    Ok(format!("{PUBLIC_PREFIX}{id}/:rw"))
+}
+
 // -- validators --------------------------------------------------------------
 
 /// Accept only a z-base32 public key the SDK itself can parse.
@@ -330,6 +345,20 @@ mod tests {
     fn a_private_address_is_not_accepted_as_a_template() {
         let agent = Root::agent(PK, "default").unwrap();
         assert!(Root::from_uri(&agent.uri().unwrap(), true).is_err());
+    }
+
+    #[test]
+    fn a_scope_matches_the_roots_capability() {
+        let root = Root::agent(PK, "default").unwrap();
+        assert_eq!(agent_scope("default").unwrap(), root.capability());
+        let template = Root::template(PK, "researcher").unwrap();
+        assert_eq!(template_scope("researcher").unwrap(), template.capability());
+    }
+
+    #[test]
+    fn a_scope_refuses_a_hostile_id() {
+        assert!(agent_scope("../escape").is_err());
+        assert!(template_scope("").is_err());
     }
 
     #[test]

@@ -12,8 +12,8 @@ use pyo3::prelude::*;
 use pubky::{AuthFlowKind, Capabilities, ClientId, PubkyGrantAuthFlow};
 
 use crate::errors::{map_sdk_error, NativeError, NativeResult};
+use crate::roots::APP_NAMESPACE;
 use crate::runtime::{block_on, runtime, sdk};
-use crate::urls::{APP_NAMESPACE, REQUIRED_CAPABILITY};
 
 /// How long to wait between relay polls while the user approves in Ring.
 const POLL_INTERVAL: Duration = Duration::from_millis(750);
@@ -91,7 +91,7 @@ impl AuthFlow {
     /// Defaults to exactly the capability this plugin needs: read+write on
     /// its own private profile directory, and nothing else.
     #[new]
-    #[pyo3(signature = (capabilities = REQUIRED_CAPABILITY, client_id = APP_NAMESPACE))]
+    #[pyo3(signature = (capabilities, client_id = APP_NAMESPACE))]
     fn new(py: Python<'_>, capabilities: &str, client_id: &str) -> PyResult<Self> {
         let (caps, client_id) = ops::parse_request(capabilities, client_id)?;
         let caps_string = caps.to_string();
@@ -139,17 +139,4 @@ impl AuthFlow {
     fn __repr__(&self) -> String {
         format!("<AuthFlow capabilities={:?}>", self.capabilities)
     }
-}
-
-/// The capability string this plugin requests. Exposed so Python (and its
-/// tests) never has to restate it.
-#[pyfunction]
-pub fn required_capability() -> &'static str {
-    REQUIRED_CAPABILITY
-}
-
-/// The client id this plugin identifies itself with during auth.
-#[pyfunction]
-pub fn client_id() -> &'static str {
-    APP_NAMESPACE
 }

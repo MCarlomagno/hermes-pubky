@@ -1,10 +1,10 @@
 [package]
 name = "hermes-pubky-native"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
-description = "Native Pubky bindings for the Hermes `pubky` memory provider"
+description = "Native Pubky bindings for the managed Hermes agent launcher"
 repository = "https://github.com/MCarlomagno/hermes-pubky-memory"
 publish = false
 
@@ -35,10 +35,6 @@ name = "testnet_fixture"
 path = "examples/testnet_fixture.rs"
 
 # The Rust e2e suite lives outside `tests/`, which holds the Python suite.
-[[test]]
-name = "e2e"
-path = "e2e/e2e.rs"
-
 [[test]]
 name = "v2"
 path = "e2e/v2.rs"

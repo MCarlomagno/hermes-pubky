@@ -1,347 +1,425 @@
-"""Reconciliation between the local outbox and the remote private profile.
+"""The checkpoint state machine: objects first, head last, verify then trust.
 
-The model is deliberately small, because v0.1 supports exactly one writer per
-profile:
+The homeserver exposes no conditional write and no multi-file transaction, so
+durability here comes from ordering rather than from a lock. Immutable objects
+and the snapshot go up before the head moves, and the head is re-read before
+and after it is written. That prevents the active head from ever referencing an
+incomplete upload *under the single-writer contract this release promises*. It
+does not eliminate a genuine simultaneous-writer race, and nothing in this
+module should be described as compare-and-swap.
 
-* With nothing queued, the remote profile is canonical and simply replaces the
-  cache.
-* With writes queued and the remote still at the revision we last synced, the
-  queue is applied and pushed as ``revision + 1``.
-* With writes queued and the remote moved underneath us, something else wrote
-  to this profile. That is outside what v0.1 promises to merge, so automatic
-  syncing stops and the user picks a side with ``--prefer remote|local``. The
-  discarded side is always backed up first.
+Reference: implementation plan sections 6.3 and 6.4.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import threading
+import random
+import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from pathlib import Path
+from typing import Callable, Optional, Protocol
 
-from .outbox import Operation, Outbox, apply_operations, utcnow
-from .schema import Profile
-from .store import Store, SyncState
+from .journal import (
+    STATE_ACKNOWLEDGED,
+    STATE_BLOCKED,
+    STATE_CONFLICT,
+    STATE_HEAD_WRITTEN,
+    STATE_SNAPSHOT_WRITTEN,
+    STATE_UPLOADING,
+    Checkpoint,
+    Journal,
+    utcnow,
+)
+from .models import Head, SchemaError, Snapshot, SnapshotRef
+from .objects import IntegrityError, ObjectCache, hash_bytes
 
 logger = logging.getLogger("hermes_pubky.sync")
 
-# Retry schedule for background pushes, capped so a long outage settles into
-# a once-a-minute poll instead of hammering the homeserver.
+# Retry window for transient failures (plan 6.3).
 INITIAL_BACKOFF = 2.0
 MAX_BACKOFF = 60.0
 
 
-class ConflictError(RuntimeError):
-    """The remote profile moved while local writes were pending."""
+class Transient(Exception):
+    """A failure worth retrying: connection, timeout, 429, retryable 5xx."""
+
+    def __init__(self, message: str, retry_after: Optional[float] = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class Fatal(Exception):
+    """A failure that will keep failing until a human fixes something."""
+
+
+class ConflictDetected(Exception):
+    """The remote head moved while this machine had work pending."""
+
+
+class RemoteProtocol(Protocol):
+    """The subset of `AgentRemote` the state machine uses."""
+
+    def read_head(self) -> Optional[Head]: ...
+    def write_head(self, head: Head) -> None: ...
+    def read_snapshot(self, ref: SnapshotRef) -> Snapshot: ...
+    def put_snapshot(self, snapshot: Snapshot) -> SnapshotRef: ...
+    def put_object_from_path(self, piece, source: Path) -> int: ...
 
 
 @dataclass
 class SyncResult:
-    """What a sync attempt did, for the CLI and for logging."""
+    """What one publication attempt did."""
 
-    status: str  # "synced" | "up-to-date" | "conflict" | "skipped" | "failed"
+    status: str  # synced | up-to-date | conflict | blocked | retry
     detail: str = ""
-    pushed: int = 0
-    revision: int = 0
+    checkpoint_id: str = ""
+    snapshot_id: str = ""
+    uploaded_objects: int = 0
+    remaining: int = 0
 
     @property
     def ok(self) -> bool:
         return self.status in ("synced", "up-to-date")
 
 
-class Syncer:
-    """Applies the outbox to the remote profile and maintains sync state."""
+def classify(exc: BaseException) -> Exception:
+    """Split a failure into retryable and not.
+
+    Auth, capability, quota and validation problems stop automatic retries:
+    repeating them burns the backoff budget and hides something the user has to
+    correct. Everything network-shaped is transient.
+    """
+    if isinstance(exc, (Transient, Fatal, ConflictDetected)):
+        return exc  # type: ignore[return-value]
+    if isinstance(exc, (SchemaError, IntegrityError, ValueError)):
+        return Fatal(str(exc))
+
+    name = type(exc).__name__
+    message = str(exc)
+    # Native exception names, matched without importing the extension so this
+    # stays testable with a fake remote.
+    if name in ("PubkyAuthError", "PubkyValidationError", "PubkyTooLargeError"):
+        return Fatal(message)
+    if name in ("PubkyTimeoutError", "PubkyNetworkError"):
+        return Transient(message)
+    if "429" in message or "Retry-After" in message:
+        return Transient(message)
+    if "quota" in message.lower() or " 413" in message:
+        return Fatal(message)
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return Transient(message)
+    return Transient(message)
+
+
+def backoff_delay(attempt: int, retry_after: Optional[float] = None) -> float:
+    """Exponential backoff with jitter, honoring a server's Retry-After."""
+    if retry_after is not None:
+        return max(0.0, min(retry_after, MAX_BACKOFF))
+    base = min(INITIAL_BACKOFF * (2 ** max(0, attempt - 1)), MAX_BACKOFF)
+    return base * (0.5 + random.random() / 2)
+
+
+class SyncEngine:
+    """Publishes sealed checkpoints, one at a time, in order."""
 
     def __init__(
         self,
-        store: Store,
-        outbox: Outbox,
-        profile_id: str,
-        connect: Callable[[], "object"],
+        journal: Journal,
+        remote: RemoteProtocol,
+        cache: ObjectCache,
+        *,
+        recovery_dir: Optional[Path] = None,
     ) -> None:
-        self.store = store
-        self.outbox = outbox
-        self.profile_id = profile_id
-        # A factory rather than a live session: a session can expire between
-        # syncs, and reconnecting is cheap next to the network round trip.
-        self._connect = connect
-        self._lock = threading.Lock()
+        self.journal = journal
+        self.remote = remote
+        self.cache = cache
+        self.recovery_dir = recovery_dir
 
-    # -- core ---------------------------------------------------------------
+    # -- one attempt --------------------------------------------------------
 
-    def sync(self, prefer: Optional[str] = None, timeout_secs: float = 10.0) -> SyncResult:
-        """Run one reconciliation pass.
-
-        ``prefer`` is ``"remote"`` or ``"local"`` and is only meaningful when a
-        conflict is recorded; it resolves the conflict and clears the flag.
-        """
-        with self._lock:
-            return self._sync_locked(prefer=prefer, timeout_secs=timeout_secs)
-
-    def _sync_locked(self, prefer: Optional[str], timeout_secs: float) -> SyncResult:
-        state = self.store.load_state()
-        pending = self.outbox.load()
-
-        if state.conflict and prefer is None:
+    def sync(self, checkpoint: Optional[Checkpoint] = None) -> SyncResult:
+        """Publish the oldest active checkpoint, or report there is nothing to do."""
+        if self.journal.conflicted_checkpoints() and checkpoint is None:
             return SyncResult(
                 status="conflict",
-                detail=(
-                    "the remote profile changed while local writes were pending; "
-                    "resolve with 'hermes pubky sync --prefer remote' or "
-                    "'hermes pubky sync --prefer local'"
-                ),
-                pushed=len(pending),
-                revision=state.last_revision,
+                detail="a conflicting checkpoint is unresolved; run "
+                       "'hermes-pubky agent sync --prefer remote|local'",
             )
+        candidate = checkpoint or self.journal.next_checkpoint()
+        if candidate is None:
+            return SyncResult(status="up-to-date", detail="nothing pending")
 
-        remote = self._connect()
-        remote_profile = remote.fetch_profile(self.profile_id, timeout_secs)
+        try:
+            return self._publish(candidate)
+        except ConflictDetected as exc:
+            self.journal.set_checkpoint_state(candidate.id, STATE_CONFLICT, str(exc))
+            logger.warning("hermes-pubky: %s", exc)
+            return SyncResult(status="conflict", detail=str(exc),
+                              checkpoint_id=candidate.id)
+        except Fatal as exc:
+            self.journal.set_checkpoint_state(candidate.id, STATE_BLOCKED, str(exc))
+            return SyncResult(status="blocked", detail=str(exc),
+                              checkpoint_id=candidate.id)
+        except Transient as exc:
+            # Stay in whatever state we reached; the bytes are still staged.
+            self.journal.set_checkpoint_state(candidate.id, candidate.state, str(exc))
+            return SyncResult(status="retry", detail=str(exc),
+                              checkpoint_id=candidate.id)
 
-        if prefer is not None:
-            return self._resolve(prefer, remote, remote_profile, pending, state, timeout_secs)
+    def _publish(self, candidate: Checkpoint) -> SyncResult:
+        snapshot = self._load_candidate(candidate)
 
-        if not pending:
-            return self._adopt_remote(remote_profile, state)
-
-        if remote_profile is not None and remote_profile.revision != state.last_revision:
-            return self._record_conflict(remote_profile, state, len(pending))
-
-        return self._push(remote, remote_profile, pending, state, timeout_secs)
-
-    def _retire(self, handled: List[Operation]) -> int:
-        """Drop the handled operations from the queue, keeping any newcomers.
-
-        A write mirrored while the push was in flight is already on disk but
-        was not part of this push. Clearing the whole file would delete it
-        before it ever reached the homeserver, so the queue is rewritten to
-        exactly the operations that arrived late. Returns how many remain.
-        """
-        handled_ids = {op.op_id for op in handled}
-        remaining = [op for op in self.outbox.load() if op.op_id not in handled_ids]
-        self.outbox.replace(remaining)
-        return len(remaining)
-
-    # -- outcomes -----------------------------------------------------------
-
-    def _adopt_remote(self, remote_profile: Optional[Profile], state: SyncState) -> SyncResult:
-        """Nothing queued: take the remote copy as canonical."""
-        if remote_profile is None:
+        # 0. If the head already names this candidate, a previous attempt
+        #    succeeded and only its response was lost. Acknowledge rather than
+        #    reporting a conflict against our own write.
+        existing = self._call(self.remote.read_head)
+        if (existing is not None
+                and existing.snapshot_id == snapshot.snapshot_id
+                and existing.sha256 == candidate.snapshot_hash):
+            self.journal.acknowledge_checkpoint(candidate.id)
+            self.journal.set_setting("acknowledged_head", existing.to_dict())
+            self.journal.set_setting("acknowledged_at", utcnow())
             return SyncResult(
-                status="up-to-date",
-                detail="no remote profile yet",
-                revision=state.last_revision,
+                status="synced",
+                detail=f"checkpoint {candidate.id[:8]} was already published; "
+                       "a previous attempt lost only its response",
+                checkpoint_id=candidate.id,
+                snapshot_id=snapshot.snapshot_id,
+                remaining=len(self.journal.active_checkpoints()),
             )
-        self.store.save_profile(remote_profile)
-        state.last_revision = remote_profile.revision
-        state.last_synced_at = utcnow()
-        state.conflict = False
-        state.conflict_detail = ""
-        state.conflict_remote_revision = 0
-        self.store.save_state(state)
-        return SyncResult(
-            status="up-to-date",
-            detail="remote profile adopted",
-            revision=remote_profile.revision,
-        )
 
-    def _record_conflict(
-        self, remote_profile: Profile, state: SyncState, pending_count: int
-    ) -> SyncResult:
-        detail = (
-            f"remote profile is at revision {remote_profile.revision} but the last "
-            f"sync from this machine saw {state.last_revision}, and "
-            f"{pending_count} local write(s) are still pending"
-        )
-        state.conflict = True
-        state.conflict_detail = detail
-        state.conflict_remote_revision = remote_profile.revision
-        self.store.save_state(state)
-        logger.warning("hermes-pubky: %s", detail)
-        return SyncResult(
-            status="conflict", detail=detail, pushed=pending_count,
-            revision=state.last_revision,
-        )
+        # 1. The head must still be where this candidate was built from.
+        self._require_expected_parent(candidate, phase="before upload")
 
-    def _push(
-        self,
-        remote: object,
-        remote_profile: Optional[Profile],
-        pending: List[Operation],
-        state: SyncState,
-        timeout_secs: float,
-        base: Optional[Profile] = None,
-    ) -> SyncResult:
-        """Apply the queue to ``base`` and push it as the next revision.
+        # 2. Immutable objects first. A missing object here can never be
+        #    referenced by the active head, because the head moves last.
+        uploaded = self._upload_objects(candidate)
 
-        ``base`` defaults to the remote profile, which is right for the normal
-        path: the remote has not moved, so replaying the queue on top of it
-        loses nothing. Conflict resolution passes an explicit base when the
-        user has chosen which side to keep.
-        """
-        if base is None:
-            base = (
-                remote_profile
-                or self.store.load_profile()
-                or Profile(profile_id=self.profile_id)
-            )
-            # Build from the remote's own pin so a base context set on another
-            # machine is not clobbered by this machine's stale cache.
-            if remote_profile is not None:
-                base.base_context = remote_profile.base_context
+        # 3. The snapshot document, whose stored digest we read back.
+        self.journal.set_checkpoint_state(candidate.id, STATE_UPLOADING)
+        ref = self._call(lambda: self.remote.put_snapshot(snapshot))
+        if ref.sha256 != candidate.snapshot_hash:
+            raise Fatal(
+                f"stored snapshot hashes to {ref.sha256}, staged bytes say "
+                f"{candidate.snapshot_hash}")
+        self.journal.set_checkpoint_state(candidate.id, STATE_SNAPSHOT_WRITTEN)
 
-        applied = apply_operations(base, pending)
-        base.profile_id = self.profile_id
-        # Always advance past the remote, or the homeserver keeps the old copy.
-        base.revision = (remote_profile.revision if remote_profile else 0) + 1
-        base.updated_at = utcnow()
+        # 4. Re-read the head immediately before moving it. This narrows, but
+        #    does not close, a simultaneous-writer window.
+        self._require_expected_parent(candidate, phase="before head write")
 
-        remote.put_profile(base, timeout_secs)  # type: ignore[attr-defined]
+        # 5. Move the head, then confirm what is actually there.
+        head = Head(kind=Head.AGENT, id=snapshot.agent_id,
+                    snapshot_id=snapshot.snapshot_id, sha256=ref.sha256)
+        self._call(lambda: self.remote.write_head(head))
+        self.journal.set_checkpoint_state(candidate.id, STATE_HEAD_WRITTEN)
 
-        self.store.save_profile(base)
-        left = self._retire(pending)
-        state.last_revision = base.revision
-        state.last_synced_at = base.updated_at
-        state.conflict = False
-        state.conflict_detail = ""
-        state.conflict_remote_revision = 0
-        self.store.save_state(state)
-        detail = f"{applied} of {len(pending)} queued write(s) changed the profile"
-        if left:
-            # Writes that landed mid-push are still queued; go round again
-            # rather than leaving them for the next trigger.
-            detail += f"; {left} arrived during the push and are still queued"
+        stored = self._call(self.remote.read_head)
+        if stored is None:
+            raise Transient("head disappeared immediately after being written")
+        if (stored.snapshot_id, stored.sha256) != (head.snapshot_id, head.sha256):
+            raise ConflictDetected(
+                f"head now points at {stored.snapshot_id} rather than "
+                f"{head.snapshot_id}; another writer intervened")
+
+        # 6. Only now is the work durable elsewhere.
+        self.journal.acknowledge_checkpoint(candidate.id)
+        self.journal.set_setting("acknowledged_head", head.to_dict())
+        self.journal.set_setting("acknowledged_at", utcnow())
         return SyncResult(
             status="synced",
-            detail=detail,
-            pushed=len(pending),
-            revision=base.revision,
+            detail=f"checkpoint {candidate.id[:8]} is saved to the homeserver",
+            checkpoint_id=candidate.id,
+            snapshot_id=snapshot.snapshot_id,
+            uploaded_objects=uploaded,
+            remaining=len(self.journal.active_checkpoints()),
         )
 
-    def _resolve(
-        self,
-        prefer: str,
-        remote: object,
-        remote_profile: Optional[Profile],
-        pending: List[Operation],
-        state: SyncState,
-        timeout_secs: float,
-    ) -> SyncResult:
-        """Resolve a conflict by discarding one side, after backing it up."""
+    # -- steps --------------------------------------------------------------
+
+    def _load_candidate(self, candidate: Checkpoint) -> Snapshot:
+        """Read the sealed snapshot bytes back off disk and verify them."""
+        path = Path(candidate.snapshot_path)
+        try:
+            body = path.read_bytes()
+        except OSError as exc:
+            raise Fatal(
+                f"sealed snapshot {path} is unreadable ({exc}); the checkpoint "
+                "cannot be published and was not discarded") from exc
+        if hash_bytes(body) != candidate.snapshot_hash:
+            raise Fatal(f"sealed snapshot {path} no longer matches its recorded hash")
+        return Snapshot.parse(body)
+
+    def _require_expected_parent(self, candidate: Checkpoint, *, phase: str) -> None:
+        head = self._call(self.remote.read_head)
+        if head is None:
+            if candidate.parent_snapshot_id is None:
+                return  # first publication for this agent
+            raise ConflictDetected(
+                f"head is absent {phase} but this checkpoint expected parent "
+                f"{candidate.parent_snapshot_id}")
+        if candidate.parent_snapshot_id is None:
+            raise ConflictDetected(
+                f"head already exists ({head.snapshot_id}) {phase} but this "
+                "checkpoint was built as the agent's first")
+        if (head.snapshot_id != candidate.parent_snapshot_id
+                or head.sha256 != candidate.parent_hash):
+            raise ConflictDetected(
+                f"remote head is {head.snapshot_id} {phase}, but this machine "
+                f"built on {candidate.parent_snapshot_id}; local work is preserved")
+
+    def _upload_objects(self, candidate: Checkpoint) -> int:
+        """Upload every object this checkpoint still needs.
+
+        After an uncertain outcome the object is re-verified rather than assumed
+        present: an object name alone is not proof of remote integrity.
+        """
+        uploaded = 0
+        for upload in self.journal.pending_uploads(candidate.id):
+            source = Path(upload.local_path)
+            if not source.is_file():
+                cached = self.cache.path_for(upload.object_path)
+                if not cached.is_file():
+                    raise Fatal(
+                        f"object {upload.object_path} is missing locally; the "
+                        "checkpoint cannot be completed")
+                source = cached
+            piece = _piece_of(upload)
+            self._call(lambda p=piece, s=source: self.remote.put_object_from_path(p, s))
+            self.journal.mark_uploaded(candidate.id, upload.object_path)
+            uploaded += 1
+        return uploaded
+
+    def _call(self, action: Callable[[], object]):
+        """Run one remote call, translating failures into our two kinds."""
+        try:
+            return action()
+        except BaseException as exc:  # noqa: BLE001 - re-raised as a typed error
+            raise classify(exc) from exc
+
+    # -- retry loop ---------------------------------------------------------
+
+    def sync_with_retries(self, deadline: Optional[float] = None,
+                          max_attempts: int = 8,
+                          sleep: Callable[[float], None] = time.sleep,
+                          now: Callable[[], float] = time.monotonic) -> SyncResult:
+        """Attempt publication, backing off on transient failures.
+
+        `deadline` is a monotonic timestamp covering the whole operation, not
+        each object, so a shutdown budget cannot be extended by retrying.
+        """
+        result = SyncResult(status="up-to-date", detail="nothing pending")
+        for attempt in range(1, max_attempts + 1):
+            result = self.sync()
+            if result.status != "retry":
+                return result
+            if deadline is not None and now() >= deadline:
+                return SyncResult(
+                    status="retry",
+                    detail=f"{result.detail} (gave up at the deadline)",
+                    checkpoint_id=result.checkpoint_id)
+            delay = backoff_delay(attempt)
+            if deadline is not None:
+                remaining = deadline - now()
+                if remaining <= 0:
+                    return result
+                delay = min(delay, remaining)
+            sleep(delay)
+        return result
+
+    # -- conflict resolution ------------------------------------------------
+
+    def resolve(self, prefer: str) -> SyncResult:
+        """Resolve a conflict by keeping one side, after preserving both.
+
+        Neither choice destroys the discarded side's recoverable bytes: the
+        objects stay in the cache and a copy of the discarded document is
+        written under `recovery/`.
+        """
         if prefer not in ("remote", "local"):
             raise ValueError("prefer must be 'remote' or 'local'")
+        conflicts = self.journal.conflicted_checkpoints()
+        if not conflicts:
+            return SyncResult(status="up-to-date", detail="no conflict to resolve")
+
+        remote_head = self._call(self.remote.read_head)
+        for candidate in conflicts:
+            self._preserve(candidate, remote_head)
 
         if prefer == "remote":
-            # Discarding local: preserve both the queue and the cached profile,
-            # so nothing the user wrote is unrecoverable.
-            local_profile = self.store.load_profile()
-            if local_profile is not None:
-                self.store.backup("local-profile", local_profile.to_bytes())
-            if pending:
-                import json
-
-                queued = json.dumps(
-                    [op.to_dict() for op in pending], ensure_ascii=False, indent=2
-                ).encode("utf-8")
-                self.store.backup("local-outbox", queued)
-            self._retire(pending)
-            result = self._adopt_remote(remote_profile, state)
+            for candidate in conflicts:
+                self.journal.set_checkpoint_state(
+                    candidate.id, STATE_ACKNOWLEDGED,
+                    "discarded in favour of the remote copy")
+            if remote_head is not None:
+                self.journal.set_setting("acknowledged_head", remote_head.to_dict())
             return SyncResult(
-                status="synced" if result.ok else result.status,
-                detail=f"kept the remote profile; {len(pending)} local write(s) backed up",
-                pushed=0,
-                revision=result.revision,
-            )
+                status="synced",
+                detail=f"kept the remote profile; {len(conflicts)} local "
+                       "checkpoint(s) preserved under recovery/")
 
-        # prefer == "local": this machine's view wins and the remote copy is
-        # discarded, mirroring what "remote" does to the local side.
-        if remote_profile is not None:
-            self.store.backup("remote-profile", remote_profile.to_bytes())
+        # prefer == "local": rebase each candidate onto what the remote is now.
+        newest = conflicts[-1]
+        snapshot = self._load_candidate(newest)
+        rebased = self._rebase(newest, snapshot, remote_head)
+        for candidate in conflicts[:-1]:
+            self.journal.set_checkpoint_state(
+                candidate.id, STATE_ACKNOWLEDGED,
+                "superseded by the rebased local checkpoint")
+        return self.sync(checkpoint=rebased)
 
-        local_base = self.store.load_profile() or Profile(profile_id=self.profile_id)
-        # A pin only this machine knows about would otherwise be lost; fall
-        # back to the remote's pin when the local cache has none.
-        if local_base.base_context is None and remote_profile is not None:
-            local_base.base_context = remote_profile.base_context
+    def _rebase(self, candidate: Checkpoint, snapshot: Snapshot,
+                remote_head: Optional[Head]) -> Checkpoint:
+        """Re-seal a candidate so its parent is the head we just read."""
+        snapshot.parent = (
+            SnapshotRef(snapshot_id=remote_head.snapshot_id, sha256=remote_head.sha256)
+            if remote_head else None)
+        body = snapshot.to_bytes()
+        path = Path(candidate.snapshot_path)
+        rebased_path = path.with_name(path.name + ".rebased")
+        rebased_path.write_bytes(body)
 
-        state.conflict = False
-        state.conflict_detail = ""
-        state.conflict_remote_revision = 0
-        result = self._push(
-            remote, remote_profile, pending, state, timeout_secs, base=local_base
+        rebased = self.journal.create_checkpoint(
+            snapshot_path=str(rebased_path),
+            snapshot_hash=hash_bytes(body),
+            parent_snapshot_id=remote_head.snapshot_id if remote_head else None,
+            parent_hash=remote_head.sha256 if remote_head else None,
         )
-        return SyncResult(
-            status=result.status,
-            detail="kept this machine's profile; the remote copy was backed up first",
-            pushed=result.pushed,
-            revision=result.revision,
-        )
+        # Carry the object list across; the objects themselves are unchanged.
+        uploads = self.journal.all_uploads(candidate.id)
+        for upload in uploads:
+            upload.checkpoint_id = rebased.id
+            upload.acknowledged = False
+        self.journal.record_uploads(rebased.id, uploads)
+        self.journal.set_checkpoint_state(
+            candidate.id, STATE_ACKNOWLEDGED, "rebased onto the current remote head")
+        return rebased
 
-
-class BackgroundSyncer:
-    """Runs :class:`Syncer` off the agent's critical path.
-
-    Memory writes must never block a turn, and a homeserver that is slow or
-    down must never be felt by the user, so pushes happen on a daemon thread
-    with exponential backoff.
-    """
-
-    def __init__(self, syncer: Syncer) -> None:
-        self.syncer = syncer
-        self._wake = threading.Event()
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._last: Optional[SyncResult] = None
-        self._backoff = INITIAL_BACKOFF
-
-    @property
-    def last_result(self) -> Optional[SyncResult]:
-        return self._last
-
-    def start(self) -> None:
-        if self._thread is not None:
+    def _preserve(self, candidate: Checkpoint, remote_head: Optional[Head]) -> None:
+        """Write both sides of a conflict somewhere recoverable."""
+        if self.recovery_dir is None:
             return
-        self._thread = threading.Thread(
-            target=self._run, name="hermes-pubky-sync", daemon=True
-        )
-        self._thread.start()
+        target = self.recovery_dir / f"{candidate.created_at.replace(':', '')}-{candidate.id[:8]}"
+        target.mkdir(parents=True, exist_ok=True)
+        source = Path(candidate.snapshot_path)
+        if source.is_file():
+            (target / "local-snapshot.json").write_bytes(source.read_bytes())
+        if remote_head is not None:
+            (target / "remote-head.json").write_bytes(remote_head.to_bytes())
+        (target / "checkpoint.json").write_text(
+            json.dumps({
+                "id": candidate.id,
+                "state": candidate.state,
+                "parentSnapshotId": candidate.parent_snapshot_id,
+                "createdAt": candidate.created_at,
+                "lastError": candidate.last_error,
+                "objects": [u.object_path for u in self.journal.all_uploads(candidate.id)],
+            }, indent=2, sort_keys=True), encoding="utf-8")
 
-    def request(self) -> None:
-        """Ask for a sync soon. Cheap and safe to call on every write."""
-        self._wake.set()
 
-    def stop(self, timeout: float = 2.0) -> None:
-        self._stop.set()
-        self._wake.set()
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=timeout)
-        self._thread = None
+def _piece_of(upload):
+    from .models import Piece
 
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            # Wait for work, but wake periodically so a queue left over from a
-            # previous run still drains without a new write to trigger it.
-            self._wake.wait(timeout=self._backoff)
-            self._wake.clear()
-            if self._stop.is_set():
-                return
-            self._attempt()
-
-    def _attempt(self) -> None:
-        try:
-            result = self.syncer.sync()
-            self._last = result
-            if result.status == "conflict":
-                # A conflict needs a human; stop retrying until they resolve it.
-                self._backoff = MAX_BACKOFF
-            elif result.ok:
-                self._backoff = INITIAL_BACKOFF
-            else:
-                self._backoff = min(self._backoff * 2, MAX_BACKOFF)
-        except Exception as exc:  # noqa: BLE001 - a sync must never crash Hermes
-            from .config import redact
-
-            self._last = SyncResult(status="failed", detail=redact(exc))
-            logger.debug("hermes-pubky: background sync failed: %s", redact(exc))
-            self._backoff = min(self._backoff * 2, MAX_BACKOFF)
+    return Piece(object=upload.object_path, sha256=upload.sha256, size=upload.size)

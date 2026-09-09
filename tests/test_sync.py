@@ -1,316 +1,378 @@
-"""Reconciliation: adoption, push, conflict detection, and resolution."""
+"""The checkpoint state machine under failure.
+
+Every remote boundary is broken in turn, the engine restarted, and the outcome
+checked against two rules: the active head never references an incomplete
+upload, and no pending local operation is silently dropped.
+"""
 
 from __future__ import annotations
 
-import json
+from pathlib import Path
 
 import pytest
+from fakes import FakeAgentRemote
 
-from hermes_pubky.outbox import Operation, Outbox
-from hermes_pubky.schema import Profile
-from hermes_pubky.store import Store
-from hermes_pubky.sync import Syncer
+from hermes_pubky import models as m
+from hermes_pubky.journal import (
+    STATE_ACKNOWLEDGED,
+    STATE_BLOCKED,
+    STATE_CONFLICT,
+    Journal,
+    Upload,
+)
+from hermes_pubky.objects import ObjectCache, hash_bytes, stage_file
+from hermes_pubky.sync import (
+    MAX_BACKOFF,
+    Fatal,
+    SyncEngine,
+    Transient,
+    backoff_delay,
+    classify,
+)
 
-from fakes import FakeRemote
-
-
-def make_syncer(store: Store, outbox: Outbox, remote: FakeRemote) -> Syncer:
-    return Syncer(store, outbox, "default", lambda: remote)
-
-
-def remote_with(revision: int = 1, **kw) -> FakeRemote:
-    return FakeRemote(Profile(profile_id="default", revision=revision, **kw))
-
-
-class TestAdoptRemote:
-    def test_with_nothing_queued_the_remote_wins(self, store, outbox):
-        remote = remote_with(revision=5, memory=["from another machine"])
-        result = make_syncer(store, outbox, remote).sync()
-        assert result.status == "up-to-date"
-        cached = store.load_profile()
-        assert cached is not None and cached.memory == ["from another machine"]
-        assert store.load_state().last_revision == 5
-
-    def test_an_absent_remote_profile_is_not_an_error(self, store, outbox):
-        result = make_syncer(store, outbox, FakeRemote()).sync()
-        assert result.status == "up-to-date"
-        assert store.load_profile() is None
+RUNTIME = m.RuntimeInfo("hermes", "0.19.0", "hermes-0.19-sqlite22-v1")
 
 
-class TestPush:
-    def test_queued_writes_are_applied_and_pushed(self, store, outbox):
-        remote = remote_with(revision=2, memory=["existing"])
-        store.save_state(_state(store, last_revision=2))
-        outbox.append(Operation("add", "memory", "new fact"))
+class Fixture:
+    """A journal, cache and engine wired to one fake remote."""
 
-        result = make_syncer(store, outbox, remote).sync()
+    def __init__(self, tmp_path: Path, remote: FakeAgentRemote) -> None:
+        self.tmp = tmp_path
+        self.remote = remote
+        self.journal = Journal(tmp_path / "journal.sqlite3")
+        self.cache = ObjectCache(tmp_path / "cache")
+        self.recovery = tmp_path / "recovery"
+        self.engine = SyncEngine(self.journal, remote, self.cache,
+                                 recovery_dir=self.recovery)
 
-        assert result.status == "synced"
-        assert result.revision == 3
-        pushed = remote.puts[-1]
-        assert pushed["memory"] == ["existing", "new fact"]
-        assert pushed["revision"] == 3
-        assert pushed["updatedAt"]
+    def stage(self, *, files: dict, parent=None, snapshot_id: str = "1" * 32):
+        """Seal a candidate with real object files on disk."""
+        records, uploads = {}, []
+        objects_dir = self.tmp / "staged" / snapshot_id
+        for logical, data in files.items():
+            source = self.tmp / "src" / logical.replace("/", "_")
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(data)
+            staged = stage_file(source, logical, objects_dir)
+            records[logical] = staged.record
+            for ref, path in staged.objects.items():
+                piece = next(p for p in staged.record.pieces if p.object == ref)
+                uploads.append((piece, path))
 
-    def test_the_queue_is_cleared_after_a_successful_push(self, store, outbox):
-        remote = remote_with(revision=1)
-        store.save_state(_state(store, last_revision=1))
-        outbox.append(Operation("add", "user", "x"))
-        make_syncer(store, outbox, remote).sync()
-        assert outbox.count() == 0
+        snapshot = m.Snapshot(
+            agent_id="default", snapshot_id=snapshot_id,
+            created_at="2026-09-09T18:00:00Z", device_id="f" * 32,
+            runtime=RUNTIME, files=records,
+            parent=m.SnapshotRef(snapshot_id=parent[0], sha256=parent[1]) if parent else None)
+        body = snapshot.to_bytes()
+        path = self.tmp / f"candidate-{snapshot_id}.json"
+        path.write_bytes(body)
 
-    def test_a_failed_push_leaves_the_queue_intact(self, store, outbox):
-        remote = remote_with(revision=1)
-        remote.fail_put = RuntimeError("homeserver down")
-        store.save_state(_state(store, last_revision=1))
-        outbox.append(Operation("add", "user", "keep me"))
+        checkpoint = self.journal.create_checkpoint(
+            snapshot_path=str(path), snapshot_hash=hash_bytes(body),
+            parent_snapshot_id=parent[0] if parent else None,
+            parent_hash=parent[1] if parent else None)
+        self.journal.record_uploads(checkpoint.id, [
+            Upload(checkpoint_id=checkpoint.id, object_path=piece.object,
+                   sha256=piece.sha256, size=piece.size, local_path=str(local),
+                   acknowledged=False)
+            for piece, local in uploads])
+        return checkpoint, snapshot
 
-        with pytest.raises(RuntimeError):
-            make_syncer(store, outbox, remote).sync()
-
-        assert outbox.count() == 1
-        assert store.load_state().last_revision == 1
-
-    def test_pushing_to_a_profile_that_does_not_exist_yet_creates_it(self, store, outbox):
-        remote = FakeRemote()
-        outbox.append(Operation("add", "memory", "first ever"))
-        result = make_syncer(store, outbox, remote).sync()
-        assert result.status == "synced" and result.revision == 1
-        assert remote.puts[-1]["memory"] == ["first ever"]
-
-    def test_the_remote_base_context_pin_is_preserved(self, store, outbox):
-        ref = {"url": "pubky://k/pub/c.json", "sha256": "ab" * 32}
-        raw = json.loads(Profile(profile_id="default", revision=1).to_bytes())
-        raw["baseContext"] = ref
-        remote = FakeRemote()
-        remote.stored["default"] = json.dumps(raw).encode()
-        store.save_state(_state(store, last_revision=1))
-        outbox.append(Operation("add", "memory", "x"))
-
-        make_syncer(store, outbox, remote).sync()
-        assert remote.puts[-1]["baseContext"] == ref
-
-    def test_replayed_operations_apply_in_order(self, store, outbox):
-        remote = remote_with(revision=1)
-        store.save_state(_state(store, last_revision=1))
-        outbox.append(Operation("add", "memory", "draft"))
-        outbox.append(Operation("replace", "memory", "final", old_text="draft"))
-
-        make_syncer(store, outbox, remote).sync()
-        assert remote.puts[-1]["memory"] == ["final"]
-
-    def test_a_queue_that_outlives_a_restart_still_drains(self, store, outbox):
-        remote = remote_with(revision=1)
-        store.save_state(_state(store, last_revision=1))
-        outbox.append(Operation("add", "memory", "written while offline"))
-
-        # Fresh objects, same paths — as if the process had restarted.
-        reopened = Syncer(Store(store.layout), Outbox(outbox.path), "default", lambda: remote)
-        result = reopened.sync()
-
-        assert result.status == "synced"
-        assert remote.puts[-1]["memory"] == ["written while offline"]
+    def close(self) -> None:
+        self.journal.close()
 
 
-class TestConflict:
-    def test_a_moved_remote_with_pending_writes_conflicts(self, store, outbox):
-        store.save_state(_state(store, last_revision=2))
-        outbox.append(Operation("add", "memory", "local write"))
-        remote = remote_with(revision=7, memory=["someone else's write"])
+@pytest.fixture
+def fx(tmp_path):
+    fixture = Fixture(tmp_path, FakeAgentRemote())
+    yield fixture
+    fixture.close()
 
-        result = make_syncer(store, outbox, remote).sync()
 
-        assert result.status == "conflict"
-        assert "revision 7" in result.detail and "saw 2" in result.detail
-        assert remote.puts == []          # nothing was pushed
-        assert outbox.count() == 1        # nothing was lost
-        assert store.load_state().conflict is True
+class TestHappyPath:
+    def test_a_first_publication_succeeds(self, fx):
+        fx.stage(files={"profile/SOUL.md": b"# me\n"})
+        result = fx.engine.sync()
+        assert result.status == "synced", result.detail
+        assert fx.remote.head is not None
+        assert fx.journal.active_checkpoints() == []
 
-    def test_syncing_again_stays_blocked_until_resolved(self, store, outbox):
-        store.save_state(_state(store, last_revision=2))
-        outbox.append(Operation("add", "memory", "local"))
-        remote = remote_with(revision=7)
-        syncer = make_syncer(store, outbox, remote)
-        syncer.sync()
+    def test_objects_go_up_before_the_snapshot_and_the_head_last(self, fx):
+        fx.stage(files={"profile/SOUL.md": b"# me\n", "workspace/a.md": b"a\n"})
+        fx.engine.sync()
+        order = fx.remote.order_of("put_object", "put_snapshot", "write_head")
+        assert order[-1] == "write_head", order
+        assert order.index("put_snapshot") == len(order) - 2, order
+        assert all(c.startswith("put_object") for c in order[:-2]), order
 
-        again = syncer.sync()
+    def test_a_second_checkpoint_builds_on_the_first(self, fx):
+        fx.stage(files={"profile/SOUL.md": b"one\n"})
+        fx.engine.sync()
+        head = m.Head.parse(fx.remote.head)
+        fx.stage(files={"profile/SOUL.md": b"two\n"},
+                 parent=(head.snapshot_id, head.sha256), snapshot_id="2" * 32)
+        assert fx.engine.sync().status == "synced"
+        assert m.Head.parse(fx.remote.head).snapshot_id == "2" * 32
+
+    def test_nothing_pending_reports_up_to_date(self, fx):
+        assert fx.engine.sync().status == "up-to-date"
+
+
+class TestFailureAtEveryBoundary:
+    @pytest.mark.parametrize("boundary", ["read_head", "put_snapshot", "write_head"])
+    def test_a_transient_failure_leaves_the_candidate_intact(self, fx, boundary):
+        checkpoint, _ = fx.stage(files={"profile/SOUL.md": b"# me\n"})
+        fx.remote.fail_at = boundary
+        fx.remote.fail_with = lambda: ConnectionError("network down")
+
+        result = fx.engine.sync()
+        assert result.status == "retry", result.detail
+        assert [c.id for c in fx.journal.active_checkpoints()] == [checkpoint.id]
+        assert Path(checkpoint.snapshot_path).exists(), "sealed bytes must survive"
+
+    @pytest.mark.parametrize("boundary", ["read_head", "put_snapshot", "write_head"])
+    def test_restarting_after_a_failure_completes_the_same_checkpoint(self, fx, boundary):
+        checkpoint, _ = fx.stage(files={"profile/SOUL.md": b"# me\n"})
+        fx.remote.fail_at = boundary
+        fx.remote.fail_with = lambda: ConnectionError("network down")
+        fx.engine.sync()
+
+        result = fx.engine.sync()
+        assert result.status == "synced", result.detail
+        assert fx.journal.get_checkpoint(checkpoint.id).state == STATE_ACKNOWLEDGED
+
+    def test_a_failure_during_an_object_upload_resumes_without_reuploading(self, fx):
+        checkpoint, _ = fx.stage(files={
+            "profile/SOUL.md": b"# me\n", "workspace/a.md": b"a\n",
+            "workspace/b.md": b"b\n"})
+        first = fx.journal.pending_uploads(checkpoint.id)[0]
+        fx.remote.fail_at = f"put_object:{first.object_path}"
+        fx.remote.fail_with = lambda: ConnectionError("network down")
+        assert fx.engine.sync().status == "retry"
+
+        # Nothing reached the head, so the previous state is still valid.
+        assert fx.remote.head is None
+
+        before = [c for c in fx.remote.calls if c.startswith("put_object")]
+        assert fx.engine.sync().status == "synced"
+        after = [c for c in fx.remote.calls if c.startswith("put_object")]
+        uploaded_twice = [o for o in set(after) if after.count(o) > 1]
+        assert not uploaded_twice, f"re-uploaded {uploaded_twice}"
+        assert len(before) < len(after)
+
+    def test_an_interrupted_upload_never_leaves_a_head_referencing_it(self, fx):
+        fx.stage(files={"profile/SOUL.md": b"# me\n", "workspace/a.md": b"a\n"})
+        fx.remote.fail_at = "put_snapshot"
+        fx.remote.fail_with = lambda: ConnectionError("network down")
+        fx.engine.sync()
+        assert fx.remote.head is None, "the head must not move before the snapshot lands"
+
+    def test_a_lost_response_after_the_head_write_is_recognized_as_success(self, fx):
+        # The write landed; only the answer was lost. A retry must converge, not
+        # report data loss.
+        checkpoint, _ = fx.stage(files={"profile/SOUL.md": b"# me\n"})
+        fx.remote.lose_at = "write_head"
+        first = fx.engine.sync()
+        assert first.status == "retry", first.detail
+        assert fx.remote.head is not None, "the head did land"
+
+        second = fx.engine.sync()
+        assert second.status == "synced", second.detail
+        assert fx.journal.get_checkpoint(checkpoint.id).state == STATE_ACKNOWLEDGED
+
+    def test_a_lost_response_after_the_snapshot_write_converges(self, fx):
+        checkpoint, _ = fx.stage(files={"profile/SOUL.md": b"# me\n"})
+        fx.remote.lose_at = "put_snapshot"
+        assert fx.engine.sync().status == "retry"
+        assert fx.engine.sync().status == "synced"
+        assert fx.journal.get_checkpoint(checkpoint.id).state == STATE_ACKNOWLEDGED
+
+    def test_an_auth_failure_blocks_instead_of_retrying(self, fx):
+        checkpoint, _ = fx.stage(files={"profile/SOUL.md": b"# me\n"})
+
+        class PubkyAuthError(Exception):
+            pass
+
+        fx.remote.fail_at = "read_head"
+        fx.remote.fail_with = lambda: PubkyAuthError("grant was revoked")
+        result = fx.engine.sync()
+        assert result.status == "blocked", result.detail
+        assert fx.journal.get_checkpoint(checkpoint.id).state == STATE_BLOCKED
+        assert Path(checkpoint.snapshot_path).exists()
+
+    def test_a_missing_local_object_blocks_rather_than_publishing_a_gap(self, fx):
+        checkpoint, _ = fx.stage(files={"workspace/a.md": b"a\n"})
+        for upload in fx.journal.pending_uploads(checkpoint.id):
+            Path(upload.local_path).unlink()
+        result = fx.engine.sync()
+        assert result.status == "blocked"
+        assert "missing locally" in result.detail
+        assert fx.remote.head is None
+
+    def test_a_tampered_sealed_snapshot_blocks(self, fx):
+        checkpoint, _ = fx.stage(files={"profile/SOUL.md": b"# me\n"})
+        Path(checkpoint.snapshot_path).write_bytes(b'{"tampered":true}')
+        result = fx.engine.sync()
+        assert result.status == "blocked"
+        assert "no longer matches" in result.detail
+
+
+class TestConflicts:
+    def _moved_remote(self, fx, snapshot_id="9" * 32):
+        other = m.Snapshot(agent_id="default", snapshot_id=snapshot_id,
+                           created_at="2026-09-09T19:00:00Z", device_id="e" * 32,
+                           runtime=RUNTIME)
+        return fx.remote.set_head(other)
+
+    def test_a_head_that_moved_before_upload_conflicts(self, fx):
+        checkpoint, _ = fx.stage(files={"profile/SOUL.md": b"mine\n"},
+                                 parent=("0" * 32, "a" * 64))
+        self._moved_remote(fx)
+
+        result = fx.engine.sync()
+        assert result.status == "conflict", result.detail
+        assert fx.journal.get_checkpoint(checkpoint.id).state == STATE_CONFLICT
+        assert Path(checkpoint.snapshot_path).exists(), "local work is preserved"
+
+    def test_a_conflict_blocks_further_syncing_until_resolved(self, fx):
+        fx.stage(files={"profile/SOUL.md": b"mine\n"}, parent=("0" * 32, "a" * 64))
+        self._moved_remote(fx)
+        fx.engine.sync()
+
+        again = fx.engine.sync()
         assert again.status == "conflict"
         assert "--prefer" in again.detail
-        assert remote.puts == []
 
-    def test_a_moved_remote_without_pending_writes_is_just_adopted(self, store, outbox):
-        store.save_state(_state(store, last_revision=2))
-        remote = remote_with(revision=7, memory=["theirs"])
-        result = make_syncer(store, outbox, remote).sync()
-        assert result.status == "up-to-date"
-        assert store.load_state().conflict is False
+    def test_a_head_created_elsewhere_conflicts_with_a_first_publication(self, fx):
+        fx.stage(files={"profile/SOUL.md": b"mine\n"})  # parent is None
+        self._moved_remote(fx)
+        result = fx.engine.sync()
+        assert result.status == "conflict"
+        assert "first" in result.detail
 
-    def test_prefer_remote_discards_local_and_backs_it_up(self, store, outbox):
-        store.save_profile(Profile(profile_id="default", revision=2, memory=["mine"]))
-        store.save_state(_state(store, last_revision=2))
-        outbox.append(Operation("add", "memory", "local write"))
-        remote = remote_with(revision=7, memory=["theirs"])
-        syncer = make_syncer(store, outbox, remote)
-        syncer.sync()
+    def test_prefer_remote_keeps_the_remote_and_preserves_local(self, fx):
+        checkpoint, _ = fx.stage(files={"profile/SOUL.md": b"mine\n"},
+                                 parent=("0" * 32, "a" * 64))
+        ref = self._moved_remote(fx)
+        fx.engine.sync()
 
-        result = syncer.sync(prefer="remote")
+        result = fx.engine.resolve("remote")
+        assert result.status == "synced", result.detail
+        assert m.Head.parse(fx.remote.head).snapshot_id == ref.snapshot_id
+        assert fx.journal.conflicted_checkpoints() == []
+        saved = list(fx.recovery.rglob("local-snapshot.json"))
+        assert saved, "the discarded local side must be recoverable"
 
-        assert result.status == "synced"
-        assert outbox.count() == 0
-        cached = store.load_profile()
-        assert cached is not None and cached.memory == ["theirs"]
-        assert store.load_state().conflict is False
-        backups = sorted(p.name for p in store.layout.backups.iterdir())
-        assert any("local-profile" in n for n in backups)
-        assert any("local-outbox" in n for n in backups)
+    def test_prefer_local_rebases_onto_the_current_remote_head(self, fx):
+        fx.stage(files={"profile/SOUL.md": b"mine\n"}, parent=("0" * 32, "a" * 64))
+        ref = self._moved_remote(fx)
+        fx.engine.sync()
 
-    def test_the_backed_up_outbox_is_readable(self, store, outbox):
-        store.save_state(_state(store, last_revision=2))
-        outbox.append(Operation("add", "memory", "recover me"))
-        remote = remote_with(revision=7)
-        syncer = make_syncer(store, outbox, remote)
-        syncer.sync()
-        syncer.sync(prefer="remote")
+        result = fx.engine.resolve("local")
+        assert result.status == "synced", result.detail
+        published = m.Snapshot.parse(fx.remote.snapshots[m.Head.parse(fx.remote.head).snapshot_id])
+        assert published.files["profile/SOUL.md"].size == 5
+        assert published.parent is not None
+        assert published.parent.snapshot_id == ref.snapshot_id, "must build on the remote"
+        assert list(fx.recovery.rglob("remote-head.json")), "remote side preserved"
 
-        backup = next(p for p in store.layout.backups.iterdir() if "local-outbox" in p.name)
-        saved = json.loads(backup.read_text())
-        assert saved[0]["content"] == "recover me"
+    def test_resolving_with_no_conflict_is_a_no_op(self, fx):
+        assert fx.engine.resolve("remote").status == "up-to-date"
 
-    def test_prefer_local_discards_the_remote_and_backs_it_up(self, store, outbox):
-        store.save_profile(Profile(profile_id="default", revision=2, memory=["mine"]))
-        store.save_state(_state(store, last_revision=2))
-        outbox.append(Operation("add", "memory", "local write"))
-        remote = remote_with(revision=7, memory=["theirs"])
-        syncer = make_syncer(store, outbox, remote)
-        syncer.sync()
+    def test_an_unknown_preference_is_refused(self, fx):
+        with pytest.raises(ValueError, match="prefer must be"):
+            fx.engine.resolve("both")
 
-        result = syncer.sync(prefer="local")
+    def test_two_simultaneous_writers_stay_outside_the_guarantee(self, fx):
+        """Documented limit: the head is re-read, not compare-and-swapped.
 
-        assert result.status == "synced"
-        # Must advance past the remote, or the homeserver keeps the old copy.
-        assert result.revision == 8
-        pushed = remote.puts[-1]["memory"]
-        assert pushed == ["mine", "local write"]
-        assert "theirs" not in pushed          # the remote side really is dropped
-        assert outbox.count() == 0
-        assert store.load_state().conflict is False
-        assert any("remote-profile" in p.name for p in store.layout.backups.iterdir())
+        A writer that moves the head between our final read and our write is not
+        prevented. What is guaranteed is that the immutable candidate survives
+        and is recoverable, which this asserts.
+        """
+        checkpoint, snapshot = fx.stage(files={"profile/SOUL.md": b"mine\n"})
 
-    def test_prefer_local_keeps_a_pin_only_the_remote_had(self, store, outbox):
-        # Losing a base context the user pinned elsewhere would be a silent
-        # regression, so it is inherited when this machine has none.
-        ref = {"url": "pubky://k/pub/c.json", "sha256": "ab" * 32}
-        raw = json.loads(Profile(profile_id="default", revision=7).to_bytes())
-        raw["baseContext"] = ref
-        remote = FakeRemote()
-        remote.stored["default"] = json.dumps(raw).encode()
-        store.save_profile(Profile(profile_id="default", revision=2))
-        store.save_state(_state(store, last_revision=2))
-        outbox.append(Operation("add", "memory", "local write"))
-        syncer = make_syncer(store, outbox, remote)
-        syncer.sync()
+        original_write = fx.remote.write_head
+        def racing_write(head):
+            # Another machine publishes in the same instant.
+            other = m.Snapshot(agent_id="default", snapshot_id="7" * 32,
+                               created_at="2026-09-09T20:00:00Z",
+                               device_id="d" * 32, runtime=RUNTIME)
+            fx.remote.set_head(other)
+        fx.remote.write_head = racing_write
 
-        syncer.sync(prefer="local")
-        assert remote.puts[-1]["baseContext"] == ref
-
-    def test_prefer_local_with_no_cached_profile_still_pushes_the_queue(self, store, outbox):
-        store.save_state(_state(store, last_revision=2))
-        outbox.append(Operation("add", "memory", "local write"))
-        remote = remote_with(revision=7, memory=["theirs"])
-        syncer = make_syncer(store, outbox, remote)
-        syncer.sync()
-
-        result = syncer.sync(prefer="local")
-        assert result.status == "synced"
-        assert remote.puts[-1]["memory"] == ["local write"]
-
-    def test_prefer_rejects_an_unknown_side(self, store, outbox):
-        outbox.append(Operation("add", "memory", "x"))
-        with pytest.raises(ValueError, match="prefer"):
-            make_syncer(store, outbox, remote_with()).sync(prefer="both")
+        result = fx.engine.sync()
+        assert result.status == "conflict", result.detail
+        # Our snapshot document is still on the server and still readable.
+        assert snapshot.snapshot_id in fx.remote.snapshots
+        assert Path(checkpoint.snapshot_path).exists()
+        fx.remote.write_head = original_write
 
 
-def _state(store: Store, **kw):
-    state = store.load_state()
-    for key, value in kw.items():
-        setattr(state, key, value)
-    return state
+class TestClassificationAndBackoff:
+    @pytest.mark.parametrize("exc,expected", [
+        (ConnectionError("down"), Transient),
+        (TimeoutError("slow"), Transient),
+        (m.SchemaError("bad document"), Fatal),
+        (ValueError("bad argument"), Fatal),
+    ])
+    def test_failures_split_into_retryable_and_not(self, exc, expected):
+        assert isinstance(classify(exc), expected)
 
+    @pytest.mark.parametrize("name,expected", [
+        ("PubkyAuthError", Fatal),
+        ("PubkyValidationError", Fatal),
+        ("PubkyTooLargeError", Fatal),
+        ("PubkyNetworkError", Transient),
+        ("PubkyTimeoutError", Transient),
+    ])
+    def test_native_error_names_are_classified(self, name, expected):
+        exc = type(name, (Exception,), {})("boom")
+        assert isinstance(classify(exc), expected)
 
-class TestConcurrentWrites:
-    """A write mirrored while a push is in flight must not be dropped.
+    def test_a_quota_failure_does_not_retry(self):
+        assert isinstance(classify(Exception("storage quota exceeded")), Fatal)
 
-    Regression: the queue used to be cleared wholesale after a successful
-    push, deleting any operation appended during the network round trip. Two
-    memory writes in quick succession would reliably lose the second.
-    """
+    def test_backoff_grows_and_is_capped(self):
+        assert backoff_delay(1) <= 2.0
+        assert backoff_delay(20) <= MAX_BACKOFF
+        assert all(backoff_delay(n) > 0 for n in range(1, 10))
 
-    def test_a_write_that_lands_during_the_push_is_kept(self, store, outbox):
-        remote = remote_with(revision=1)
-        store.save_state(_state(store, last_revision=1))
-        outbox.append(Operation("add", "memory", "first write"))
+    def test_a_retry_after_hint_is_honored(self):
+        assert backoff_delay(5, retry_after=3.0) == 3.0
+        assert backoff_delay(5, retry_after=9999.0) == MAX_BACKOFF
 
-        # The agent mirrors another write while put_profile is in flight.
-        original_put = remote.put_profile
+    def test_the_retry_loop_stops_at_its_deadline(self, fx):
+        fx.stage(files={"profile/SOUL.md": b"# me\n"})
+        fx.remote.fail_at = "read_head"
+        fx.remote.fail_with = lambda: ConnectionError("down")
+        # Re-arm the failure every attempt so only the deadline can end it.
+        original = fx.engine.sync
+        def always_retry(*a, **k):
+            fx.remote.fail_at = "read_head"
+            return original(*a, **k)
+        fx.engine.sync = always_retry
 
-        def put_then_write(profile, timeout_secs=10.0):
-            original_put(profile, timeout_secs)
-            outbox.append(Operation("add", "user", "written mid-push"))
+        # A fake clock that only advances when the engine sleeps, so the
+        # deadline is deterministic.
+        clock = [1000.0]
+        slept = []
 
-        remote.put_profile = put_then_write
+        def fake_sleep(delay):
+            slept.append(delay)
+            clock[0] += delay
 
-        result = make_syncer(store, outbox, remote).sync()
+        result = fx.engine.sync_with_retries(
+            deadline=clock[0] + 5.0, max_attempts=50,
+            sleep=fake_sleep, now=lambda: clock[0])
+        assert result.status == "retry"
+        assert sum(slept) <= 5.0 + 1e-6, f"slept past the deadline: {sum(slept)}"
+        assert len(slept) < 50, "must stop at the deadline, not exhaust attempts"
 
-        assert result.status == "synced"
-        assert remote.puts[-1]["memory"] == ["first write"]
-        # The latecomer survives, and only it.
-        survivors = [op.content for op in outbox.load()]
-        assert survivors == ["written mid-push"]
-        assert "still queued" in result.detail
-
-    def test_the_kept_write_is_pushed_on_the_next_pass(self, store, outbox):
-        remote = remote_with(revision=1)
-        store.save_state(_state(store, last_revision=1))
-        outbox.append(Operation("add", "memory", "first write"))
-
-        original_put = remote.put_profile
-        fired = []
-
-        def put_then_write(profile, timeout_secs=10.0):
-            original_put(profile, timeout_secs)
-            if not fired:
-                fired.append(True)
-                outbox.append(Operation("add", "user", "written mid-push"))
-
-        remote.put_profile = put_then_write
-        syncer = make_syncer(store, outbox, remote)
-        syncer.sync()
-        syncer.sync()
-
-        assert outbox.count() == 0
-        assert remote.puts[-1]["user"] == ["written mid-push"]
-        assert remote.puts[-1]["memory"] == ["first write"]
-
-    def test_discarding_local_writes_keeps_one_that_arrives_mid_resolve(
-        self, store, outbox
-    ):
-        # Writes queued before `--prefer remote` are what the user chose to
-        # discard. One that lands *during* the resolution was never offered
-        # up, so it has to survive.
-        store.save_state(_state(store, last_revision=2))
-        outbox.append(Operation("add", "memory", "conflicted write"))
-        remote = remote_with(revision=7)
-        syncer = make_syncer(store, outbox, remote)
-        syncer.sync()
-
-        original_fetch = remote.fetch_profile
-
-        def fetch_then_write(profile_id, timeout_secs=5.0):
-            result = original_fetch(profile_id, timeout_secs)
-            outbox.append(Operation("add", "user", "written mid-resolve"))
-            return result
-
-        remote.fetch_profile = fetch_then_write
-        syncer.sync(prefer="remote")
-
-        assert [op.content for op in outbox.load()] == ["written mid-resolve"]
+    def test_the_retry_loop_succeeds_after_a_single_failure(self, fx):
+        fx.stage(files={"profile/SOUL.md": b"# me\n"})
+        fx.remote.fail_at = "read_head"
+        fx.remote.fail_with = lambda: ConnectionError("down")
+        result = fx.engine.sync_with_retries(sleep=lambda _d: None)
+        assert result.status == "synced", result.detail

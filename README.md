@@ -1,124 +1,165 @@
 # hermes-pubky
 
-Keep a [Hermes](https://github.com/NousResearch/hermes) agent's context on your own
-[Pubky](https://github.com/pubky/pubky-core) homeserver instead of on one laptop.
+Run a [Hermes](https://github.com/NousResearch/hermes) agent whose saved state
+lives on your own [Pubky](https://github.com/pubky/pubky-core) homeserver. The
+laptop becomes a working copy; the agent belongs to you.
 
-> **0.1, alpha.** A 0.2 rewrite is specified in the
-> [implementation plan](docs/IMPLEMENTATION-PLAN.md) and the pinned
-> [Hermes integration record](docs/HERMES-COMPATIBILITY.md). It replaces 0.1
-> outright, with no migration path. Everything below describes 0.1, which is
-> what ships today.
+> **0.2.0 alpha.** This replaces the 0.1 memory-overlay plugin outright. There
+> is no migration: 0.1 data and commands are unsupported, and left untouched.
 
 ## Why
 
-Hermes stores what it knows about you in `SOUL.md`, `USER.md` and `MEMORY.md` on
-one machine. New laptop, fresh container, throwaway VM: the agent starts from
-nothing. The usual alternative is a memory SaaS, which makes your agent portable
-by moving it into someone else's account.
+Hermes keeps everything it knows in one directory on one machine: `SOUL.md`,
+your memories, its learned skills, your conversations. New laptop, fresh
+container, throwaway VM, and the agent starts from nothing. The usual
+alternative is a memory SaaS, which makes your agent portable by moving it into
+someone else's account.
 
-This adds a third option. A memory provider named `pubky` keeps two things in
-documents addressed by your own keypair:
+This is a third option. The homeserver holds the authoritative copy of the
+agent; a local Hermes reconstructs a working copy, runs it, and saves changes
+back. What travels:
 
-- a **private overlay** of your user facts and agent memory, updated whenever
-  Hermes writes memory
-- a **public base context**, shareable agent instructions at a `pubky://` URL,
-  pinned by hash so its author cannot change your agent's instructions after you
-  approve them
+- instructions (`SOUL.md`), user and agent memories
+- learned skills and their assets
+- allowlisted settings
+- the conversation database, including tool calls, compaction and rewind history
+- a designated workspace: notes, references, outputs
 
-Your local `SOUL.md`, `USER.md` and `MEMORY.md` are read, never written, and
-still take precedence over anything the plugin injects.
+What stays on the machine: API keys, OAuth sessions, the Pubky grant itself, and
+anything else machine-specific.
 
 ## Install
 
 ```bash
-cd ~/.hermes/hermes-agent
-uv pip install hermes-pubky==0.1.0
-hermes-pubky install
-hermes memory setup pubky
+uv pip install hermes-pubky==0.2.0 "hermes-agent==0.19.0"
+hermes-pubky agent init default
+hermes-pubky run default
 ```
 
-Needs Python 3.11–3.13, Hermes 0.19, and a Pubky homeserver on v0.11 or later.
+Needs Python 3.11–3.13, Hermes 0.19.0 exactly, and a Pubky homeserver on v0.11
+or later. `agent init` asks Pubky Ring to authorize one scoped capability, then
+publishes the agent's first checkpoint.
 
-`hermes-pubky install` writes a three-file shim to `$HERMES_HOME/plugins/pubky/`.
-Hermes finds memory providers by scanning that directory rather than through
-Python entry points, so a pip install alone leaves the provider invisible. The
-shim imports the installed package, so upgrading is `uv pip install -U
-hermes-pubky`.
+On a second computer:
 
-Setup asks for a profile id, opens a [Pubky Ring](https://pubky.org)
-authorization URL, then offers to pin a public base context and to import your
-existing `USER.md` / `MEMORY.md`. It prints filenames, entry counts and sizes
-before copying anything, and never modifies the local files. The grant secret
-goes to your profile-scoped `.env` at mode `0600` and stays on the machine.
+```bash
+uv pip install hermes-pubky==0.2.0 "hermes-agent==0.19.0"
+hermes-pubky agent attach pubky://<owner>/priv/hermes.pubky.app/v2/agents/default/head.json
+hermes-pubky run default
+```
+
+Nothing is copied between machines. Instructions, memories, skills, settings and
+conversations come back from the homeserver; workspace documents are fetched
+when the agent asks for them.
 
 ## Commands
 
 ```text
-hermes pubky status [--offline]     grant, cache, revision, pending writes
-hermes pubky login                  authorize this machine
-hermes pubky logout                 revoke the grant, delete the local secret
-hermes pubky sync                   reconcile pending writes
-hermes pubky sync --prefer remote   on conflict, keep the remote profile
-hermes pubky sync --prefer local    on conflict, keep this machine's
-hermes pubky base set <pubky-url>   pin a public base context
-hermes pubky base refresh           re-approve it after the author changed it
-hermes pubky base clear             unpin it
+hermes-pubky run <id> [--resume SESSION] [--offline] [--query TEXT]
+
+hermes-pubky agent init <id> [--from-hermes-home PATH] [--workspace PATH]
+hermes-pubky agent attach <pubky-uri>
+hermes-pubky agent list
+hermes-pubky agent status <id> [--json] [--offline]
+hermes-pubky agent login <id>
+hermes-pubky agent logout <id>
+hermes-pubky agent sync <id> [--prefer local|remote]
+hermes-pubky agent files <id> list|fetch|import|remove
+hermes-pubky agent history <id>
+hermes-pubky agent restore <id> <snapshot-id>
+
+hermes-pubky template init|inspect|publish <directory>
+hermes-pubky template adopt <agent-id> <pubky-uri>
+hermes-pubky template update <agent-id>
 ```
+
+Exit codes: 0 done, 1 usage, 2 saved locally but not yet on the homeserver,
+3 conflict, 4 authorization needed, 5 quota, 6 integrity or unsupported runtime.
 
 ## What it can reach
 
-Setup requests one capability:
+`agent init` requests one capability:
 
 ```text
-/priv/hermes.pubky.app/v1/profiles/:rw
+/priv/hermes.pubky.app/v2/agents/<id>/:rw
 ```
 
-Read and write inside its own directory. It holds no root capability and cannot
-read your other apps' data. The plugin also rejects paths outside that directory
-locally, before a request leaves the process. `logout` revokes the grant at the
-homeserver through the session's own `DELETE /auth/grant/session`.
+Read and write inside that agent's own directory. No root capability, no access
+to your other apps. The launcher also refuses paths outside that directory
+locally, before a request leaves the process, and keeps the grant out of the
+Hermes child's environment entirely.
+
+Publishing a template needs its own separate capability under `/pub/`. An
+agent's grant can never publish.
 
 ## Read this before you store anything
 
-Your homeserver operator can read the overlay. `/priv` is access-controlled, not
+Your homeserver operator can read your agent. `/priv` is access-controlled, not
 encrypted. If you self-host, that operator is you; otherwise assume whoever runs
-your homeserver can read it, and keep sensitive facts in your local `USER.md`.
-Credentials, conversations and tool results are never stored.
+your homeserver can read your instructions, memories and conversations.
+Credentials are never uploaded, but a conversation can contain anything you or a
+tool put in it.
 
-One writer per profile. Read from as many machines as you like. If the remote
-revision moves while local writes are pending, syncing stops and asks you to
-pick a side with `--prefer`. Whichever side you drop is written to
-`$HERMES_HOME/pubky/<profile-id>/backups/` first.
+One writer at a time. Read from as many machines as you like, but stop and sync
+on one before writing from another. If the remote checkpoint moves while you
+have unsaved work, syncing stops and asks you to choose with `--prefer`;
+whichever side you drop is preserved under `recovery/` first.
 
-Offline is the normal case. Startup reads the local cache, then refreshes with a
-five-second budget. Memory writes queue in a local outbox, survive restarts, and
-retry with backoff capped at 60 seconds. The injected prompt block says when it
-is working from a stale cache.
+Offline works. Startup reads the local working copy, then refreshes with a
+five-second budget. Changes are sealed into local checkpoints that survive
+restarts and retry with backoff capped at 60 seconds. A run that could not reach
+the homeserver exits 2 and says `saved locally; not yet saved to homeserver`.
 
-Small by design. 64 KiB per document, 4,000 characters per entry, 200 entries
-each for `user` and `memory`. A download is cut off mid-stream past the cap
-whatever the server claims in `Content-Length`.
+A cold attach downloads the conversation database in full. It is streamed and
+reassembled on disk, never held in memory, but a large history takes time.
+Workspace documents stay remote until requested.
 
-Not in 0.1: publishing public contexts, semantic retrieval, session archives,
-credential storage, Windows wheels, and multi-writer merge. The provider exposes
-no tools and performs no recall.
+History is kept. Older checkpoints remain recoverable and count against your
+homeserver quota. Removing a file drops it from the current inventory, not from
+history; this is not secure erasure.
 
-The storage schema is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the
-threat model is in [docs/SECURITY.md](docs/SECURITY.md).
+Not in 0.2: multi-device merge, client-side encryption, portable credentials,
+semantic retrieval, Windows wheels, and harnesses other than Hermes 0.19.0.
+
+## How it fits together
+
+```text
+hermes-pubky run <id>
+  -> read and verify the remote checkpoint
+  -> materialize a dedicated HERMES_HOME and workspace
+  -> start Hermes as a child, with HERMES_HOME set before it imports
+       -> the in-process plugin reports changes and serves two workspace tools
+  -> the supervisor owns the lock, the journal and every network call
+  -> final capture and sync after the child exits
+```
+
+Storage is content-addressed. A checkpoint is an immutable snapshot document
+naming immutable objects; only `head.json` is mutable, and it moves last. The
+homeserver offers no conditional write, so this is ordering, not a lock:
+concurrent writers remain unsupported and are detected rather than merged.
+
+```text
+/priv/hermes.pubky.app/v2/agents/<id>/{head,snapshots/*,objects/*}.json
+/pub/hermes.pubky.app/v2/templates/<id>/{head,snapshots/*,objects/*}.json
+```
+
+Markdown is stored as Markdown and JSON as JSON, so what is on your homeserver
+is readable there. Files over 1 MiB, and the database always, are split into
+1 MiB chunks.
 
 ## Development
 
 ```bash
 uv venv --python 3.11 .venv
-uv pip install --python .venv/bin/python maturin pytest pyyaml
+uv pip install --python .venv/bin/python maturin pytest "hermes-agent==0.19.0"
 PYO3_PYTHON="$PWD/.venv/bin/python" .venv/bin/maturin develop
 
-.venv/bin/pytest        # Python tests, no network or homeserver needed
+.venv/bin/pytest        # Python tests; the Hermes ones skip if it is absent
 cargo test --lib        # Rust unit tests
 ```
 
-The end-to-end suite runs against a real Pubky v0.11 testnet, so it needs
-PostgreSQL for the homeserver and the well-known testnet ports free:
+The end-to-end and acceptance suites need PostgreSQL for the homeserver and the
+well-known testnet ports free:
 
 ```bash
 docker run -d --name hermes-pubky-pg \
@@ -126,33 +167,33 @@ docker run -d --name hermes-pubky-pg \
   -p 5432:5432 postgres:18-alpine
 
 export TEST_PUBKY_CONNECTION_STRING="postgres://test_user:test_pass@localhost:5432/postgres?pubky-test=true"
-cargo test --test e2e -- --ignored --test-threads=1
+cargo test --test v2 -- --ignored --test-threads=1
 ```
 
-Those tests are `#[ignore]`d and single-threaded because the static testnet binds
-fixed ports. Stop any running `testnet_fixture` first.
-
-To drive the real CLI by hand, start a testnet that prints a pre-authorized
-grant:
+A real managed Hermes turn, against a local fake model so no credentials are
+needed:
 
 ```bash
-cargo run --example testnet_fixture
+python scripts/check_managed_hermes_integration.py
 ```
+
+The full recovery scenario, one agent across two machines:
 
 ```bash
-export HERMES_PUBKY_TESTNET=1
-export HERMES_PUBKY_GRANT_SECRET="<grant_secret from the JSON>"
-hermes-pubky install && hermes memory setup pubky
+cargo run --example testnet_fixture > /tmp/fixture.json &
+HERMES_PUBKY_TESTNET=1 python scripts/check_managed_handoff.py --fixture /tmp/fixture.json
 ```
 
-A scripted version of the same check:
+Pinned upstream versions, changed only as a deliberate compatibility decision
+with tests to match:
 
-```bash
-HERMES_HOME=/tmp/hermes-home python scripts/check_hermes_integration.py
-```
+| | |
+| --- | --- |
+| Hermes | `hermes-agent==0.19.0`, conversation schema 22 |
+| Pubky SDK | v0.11.0 commit `6a14bdb8fa2e30ef4e4b241fcdd3992c453d2378` |
 
-The Pubky Rust SDK is pinned to the v0.11.0 commit
-`6a14bdb8fa2e30ef4e4b241fcdd3992c453d2378`, and `Cargo.lock` is committed.
+`Cargo.lock` is committed. `tests/test_hermes_contract.py` holds the upstream
+contract as executable tests and fails if the installed package drifts from it.
 
 ## License
 

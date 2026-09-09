@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Post-install smoke test for a built wheel.
 
-Confirms the wheel imports, the compiled extension loaded, the constants are
-the ones the plugin promises, and the path policy is actually enforced. Run
-against an installed package, not the source tree.
+Confirms the wheel imports, the compiled extension loaded, the protocol
+constants are what the package promises, and the path policy survived
+packaging. Run against an installed package, not the source tree.
 """
 
 from __future__ import annotations
@@ -18,41 +18,55 @@ def main() -> int:
     import hermes_pubky
     from hermes_pubky import _native
 
-    assert _native.REQUIRED_CAPABILITY == "/priv/hermes.pubky.app/v1/profiles/:rw"
-    assert _native.MAX_DOCUMENT_BYTES == 65536
+    assert _native.PROTOCOL_VERSION == "v2"
     assert _native.APP_NAMESPACE == "hermes.pubky.app"
-    assert hermes_pubky.__version__ == _native.__version__
+    assert _native.MAX_OBJECT_BYTES == 1024 * 1024
+    assert _native.MAX_HEAD_BYTES == 4 * 1024
+    assert _native.MAX_SNAPSHOT_BYTES == 1024 * 1024
+    assert hermes_pubky.__version__ == _native.__version__, (
+        f"{hermes_pubky.__version__} != {_native.__version__}")
 
-    _author, path, _url = _native.parse_context_url(f"pubky://{PK}/pub/ctx.json")
-    assert path == "/pub/ctx.json", path
+    # Addresses and scopes.
+    uri = _native.agent_uri(PK, "default")
+    assert uri.endswith("/priv/hermes.pubky.app/v2/agents/default/head.json"), uri
+    assert _native.parse_agent_uri(uri) == (PK, "default")
+    assert _native.agent_scope("default") == \
+        "/priv/hermes.pubky.app/v2/agents/default/:rw"
+    assert _native.template_scope("researcher") == \
+        "/pub/hermes.pubky.app/v2/templates/researcher/:rw"
 
     # The policy must survive packaging, not just live in the source tree.
-    for hostile in (f"pubky://{PK}/priv/x.json", f"pubky://{PK}/pub/../priv/x.json"):
+    for hostile in (
+        f"pubky://{PK}/priv/hermes.pubky.app/v1/profiles/default.json",
+        f"pubky://{PK}/pub/hermes.pubky.app/v2/templates/x/head.json",
+        f"pubky://{PK}/priv/hermes.pubky.app/v2/agents/../escape/head.json",
+    ):
         try:
-            _native.parse_context_url(hostile)
+            _native.parse_agent_uri(hostile)
         except _native.PubkyValidationError:
             pass
         else:
-            raise AssertionError(f"path policy not enforced for {hostile}")
+            raise AssertionError(f"address policy not enforced for {hostile}")
 
-    assert _native.profile_path("default") == "/priv/hermes.pubky.app/v1/profiles/default.json"
+    # Every module the launcher needs must be present in the wheel.
+    import importlib
 
-    # The provider must be constructible without Hermes present.
-    from hermes_pubky.provider import PubkyMemoryProvider
+    for name in ("cli", "database", "files", "hermes_adapter", "journal",
+                 "models", "objects", "onboarding", "paths", "projection",
+                 "provider", "restore", "status", "storage", "supervisor",
+                 "sync", "templates"):
+        importlib.import_module(f"hermes_pubky.{name}")
 
-    assert PubkyMemoryProvider().name == "pubky"
+    from hermes_pubky import cli, models, provider
 
-    # The shim templates must be packaged, or `hermes-pubky install` breaks.
-    from hermes_pubky.installer import TEMPLATE_DIR, FILES
-
-    for template_name, _dest in FILES:
-        assert (TEMPLATE_DIR / template_name).is_file(), f"missing template {template_name}"
+    assert cli.build_parser() is not None
+    assert provider.PubkyMemoryProvider().name == "pubky"
+    assert models.SCHEMA_VERSION == 2
 
     print(
         f"smoke test ok: hermes-pubky {hermes_pubky.__version__} "
         f"on {platform.system()}/{platform.machine()} "
-        f"python {platform.python_version()}"
-    )
+        f"python {platform.python_version()}")
     return 0
 
 

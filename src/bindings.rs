@@ -402,6 +402,35 @@ pub fn agent_capability(owner: &str, agent_id: &str) -> PyResult<String> {
     Ok(Root::agent(owner, agent_id)?.capability())
 }
 
+/// The identity a grant belongs to.
+///
+/// A capability names a path, not an owner, so after login the only way to
+/// learn whose agent this is, is to restore the session and ask it.
+#[pyfunction]
+#[pyo3(signature = (secret, timeout_secs = 10.0))]
+pub fn session_owner(py: Python<'_>, secret: &str, timeout_secs: f64) -> PyResult<String> {
+    let secret = secret.to_string();
+    Ok(py.detach(move || -> NativeResult<String> {
+        let session = block_on(timeout_secs, session_ops::restore(&secret))?;
+        Ok(session.info().public_key().z32())
+    })?)
+}
+
+/// The capability an agent needs, without needing to know its owner.
+///
+/// Login happens before the owner is known: the user approves a scope, and the
+/// resulting session reports whose it is.
+#[pyfunction]
+pub fn agent_scope(agent_id: &str) -> PyResult<String> {
+    Ok(crate::roots::agent_scope(agent_id)?)
+}
+
+/// The capability publishing a template needs, owner-independent.
+#[pyfunction]
+pub fn template_scope(template_id: &str) -> PyResult<String> {
+    Ok(crate::roots::template_scope(template_id)?)
+}
+
 /// Split a canonical agent URI into `(owner, agent_id)`.
 #[pyfunction]
 pub fn parse_agent_uri(uri: &str) -> PyResult<(String, String)> {

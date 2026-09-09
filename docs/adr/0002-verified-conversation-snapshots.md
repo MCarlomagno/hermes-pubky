@@ -1,3 +1,0 @@
-# Preserve conversation state through versioned SQLite snapshots
-
-Hermes 0.19.0's session importer skips existing IDs and recreates messages as active, so exporting and reimporting ordinary transcripts cannot preserve all rewind and compaction behavior. The 0.2 adapter uses consistent SQLite backups with explicit runtime-state normalization and hashed chunks, validated against the pinned Hermes schema. This couples initial portability to a tested Hermes version and requires a full database download on a new computer, but preserves saved conversation semantics and avoids a second hand-maintained session importer.

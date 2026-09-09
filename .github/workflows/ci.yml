@@ -13,6 +13,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  HERMES_VERSION: "0.19.0"
 
 jobs:
   rust:
@@ -28,17 +29,14 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Unit tests
-        run: cargo test --lib
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --lib
 
   e2e:
     name: Rust e2e (Pubky v0.11 testnet)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:18-alpine
@@ -63,9 +61,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      - name: End-to-end tests
+      - name: Storage protocol against a live testnet
         # Single-threaded: the static testnet binds fixed, well-known ports.
-        run: cargo test --test e2e -- --ignored --test-threads=1 --nocapture
+        run: cargo test --test v2 -- --ignored --test-threads=1 --nocapture
 
   python:
     name: Python ${{ matrix.python-version }}
@@ -83,21 +81,18 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install build and test tooling
-        run: uv pip install --system maturin pytest pyyaml
       - name: Build and install the wheel
-        # Installing the built wheel (rather than `maturin develop`, which
-        # needs a virtualenv) means the tests exercise the shipped artifact.
+        # Installing the built wheel means the tests exercise the shipped
+        # artifact, not the source tree.
         run: |
+          uv pip install --system maturin pytest
           maturin build --release --out dist
           uv pip install --system --no-index --find-links dist hermes-pubky
-      - name: Smoke-test the installed wheel
-        run: python scripts/smoke_test.py
-      - name: Run the test suite
-        run: pytest -q
+      - run: python scripts/smoke_test.py
+      - run: pytest -q
 
-  hermes-integration:
-    name: Hermes integration
+  hermes:
+    name: Managed Hermes integration
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -108,18 +103,56 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      - name: Build a wheel
+      - name: Install the pinned Hermes beside the package
         run: |
-          uv pip install --system maturin
+          uv pip install --system maturin pytest "hermes-agent==${HERMES_VERSION}"
           maturin build --release --out dist
-      - name: Install into a clean Hermes environment
+          uv pip install --system --no-index --find-links dist hermes-pubky
+      - name: Upstream contract and conversation fixtures
+        run: pytest tests/test_hermes_contract.py tests/test_database.py -q
+      - name: Launch a real managed Hermes turn
+        run: python scripts/check_managed_hermes_integration.py
+
+  handoff:
+    name: A-to-B handoff (Hermes + Pubky testnet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_pass
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_PUBKY_CONNECTION_STRING: postgres://test_user:test_pass@localhost:5432/postgres?pubky-test=true
+      HERMES_PUBKY_TESTNET: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install everything the acceptance test needs
         run: |
-          uv venv --python 3.11 /tmp/hermes-env
-          uv pip install --python /tmp/hermes-env/bin/python "hermes-agent==${HERMES_VERSION}"
-          uv pip install --python /tmp/hermes-env/bin/python dist/*.whl
-        env:
-          HERMES_VERSION: "0.19.0"
-      - name: Verify discovery, injection and CLI registration
-        run: /tmp/hermes-env/bin/python scripts/check_hermes_integration.py
-        env:
-          HERMES_HOME: /tmp/hermes-home
+          uv pip install --system maturin "hermes-agent==${HERMES_VERSION}"
+          maturin build --release --out dist
+          uv pip install --system --no-index --find-links dist hermes-pubky
+      - name: Start a testnet with pre-authorized grants
+        run: |
+          cargo run --release --example testnet_fixture > /tmp/fixture.json 2> /tmp/fixture.err &
+          for _ in $(seq 1 180); do
+            grep -q READY /tmp/fixture.json && break
+            sleep 1
+          done
+          grep -q READY /tmp/fixture.json || { cat /tmp/fixture.err; exit 1; }
+      - name: Recover an agent on a second machine
+        run: python scripts/check_managed_handoff.py --fixture /tmp/fixture.json
