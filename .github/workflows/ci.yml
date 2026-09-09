@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, unit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --lib
+
+  e2e:
+    name: Rust e2e (Pubky v0.11 testnet)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: test_user
+          POSTGRES_PASSWORD: test_pass
+          POSTGRES_DB: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # The homeserver under test needs a real Postgres; this mirrors the
+      # connection string pubky-core's own CI uses.
+      TEST_PUBKY_CONNECTION_STRING: postgres://test_user:test_pass@localhost:5432/postgres?pubky-test=true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: End-to-end tests
+        # Single-threaded: the static testnet binds fixed, well-known ports.
+        run: cargo test --test e2e -- --ignored --test-threads=1 --nocapture
+
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install build and test tooling
+        run: uv pip install --system maturin pytest pyyaml
+      - name: Build and install the wheel
+        # Installing the built wheel (rather than `maturin develop`, which
+        # needs a virtualenv) means the tests exercise the shipped artifact.
+        run: |
+          maturin build --release --out dist
+          uv pip install --system --no-index --find-links dist hermes-pubky
+      - name: Smoke-test the installed wheel
+        run: python scripts/smoke_test.py
+      - name: Run the test suite
+        run: pytest -q
+
+  hermes-integration:
+    name: Hermes integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Build a wheel
+        run: |
+          uv pip install --system maturin
+          maturin build --release --out dist
+      - name: Install into a clean Hermes environment
+        run: |
+          uv venv --python 3.11 /tmp/hermes-env
+          uv pip install --python /tmp/hermes-env/bin/python "hermes-agent==${HERMES_VERSION}"
+          uv pip install --python /tmp/hermes-env/bin/python dist/*.whl
+        env:
+          HERMES_VERSION: "0.19.0"
+      - name: Verify discovery, injection and CLI registration
+        run: /tmp/hermes-env/bin/python scripts/check_hermes_integration.py
+        env:
+          HERMES_HOME: /tmp/hermes-home

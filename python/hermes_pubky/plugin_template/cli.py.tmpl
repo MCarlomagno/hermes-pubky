@@ -1,0 +1,5 @@
+"""CLI shim for ``hermes pubky ...`` — see __init__.py.tmpl."""
+
+from hermes_pubky.cli import pubky_command, register_cli  # noqa: F401
+
+__all__ = ["register_cli", "pubky_command"]

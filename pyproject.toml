@@ -1,0 +1,51 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "hermes-pubky"
+version = "0.1.0"
+description = "Portable Hermes agent context over Pubky — public base context plus a private, portable memory overlay"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11,<3.14"
+authors = [{ name = "Marcos Carlomagno" }]
+keywords = ["hermes", "pubky", "memory", "agent", "portable-context"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Rust",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# Hermes itself is NOT a hard dependency: the plugin is installed into an
+# existing Hermes environment, and the pure-data modules must stay importable
+# (and testable) without it.
+test = ["pytest>=8", "pyyaml>=6"]
+
+[project.urls]
+Homepage = "https://github.com/MCarlomagno/hermes-pubky"
+Repository = "https://github.com/MCarlomagno/hermes-pubky"
+Issues = "https://github.com/MCarlomagno/hermes-pubky/issues"
+
+[project.scripts]
+hermes-pubky = "hermes_pubky.__main__:main"
+
+[tool.maturin]
+python-source = "python"
+module-name = "hermes_pubky._native"
+features = ["pyo3/extension-module"]
+include = [
+  { path = "python/hermes_pubky/plugin_template/*", format = ["sdist", "wheel"] },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error"]
