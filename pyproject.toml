@@ -31,9 +31,9 @@ dependencies = []
 test = ["pytest>=8", "pyyaml>=6"]
 
 [project.urls]
-Homepage = "https://github.com/MCarlomagno/hermes-pubky"
-Repository = "https://github.com/MCarlomagno/hermes-pubky"
-Issues = "https://github.com/MCarlomagno/hermes-pubky/issues"
+Homepage = "https://github.com/MCarlomagno/hermes-pubky-memory"
+Repository = "https://github.com/MCarlomagno/hermes-pubky-memory"
+Issues = "https://github.com/MCarlomagno/hermes-pubky-memory/issues"
 
 [project.scripts]
 hermes-pubky = "hermes_pubky.__main__:main"

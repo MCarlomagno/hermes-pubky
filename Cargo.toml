@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.89"
 license = "MIT"
 description = "Native Pubky bindings for the Hermes `pubky` memory provider"
-repository = "https://github.com/MCarlomagno/hermes-pubky"
+repository = "https://github.com/MCarlomagno/hermes-pubky-memory"
 publish = false
 
 [lib]

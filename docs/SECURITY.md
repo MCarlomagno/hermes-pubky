@@ -64,4 +64,4 @@ parent; mirroring either would pollute the portable overlay.
 ## Reporting
 
 Please open a security issue at
-<https://github.com/MCarlomagno/hermes-pubky/issues>.
+<https://github.com/MCarlomagno/hermes-pubky-memory/issues>.

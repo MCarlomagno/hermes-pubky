@@ -4,22 +4,22 @@ Everything below is intentionally left for a human: nothing here has been
 committed, pushed, tagged or published. The working tree is a complete,
 validated repository with `git init` already run and no commits.
 
-## 1. Create the GitHub repository
+## 1. Create the GitHub repository  ✅ done
 
 ```bash
-gh repo create MCarlomagno/hermes-pubky --public \
+gh repo create MCarlomagno/hermes-pubky-memory --public \
   --description "Portable Hermes agent context over Pubky" \
-  --homepage "https://github.com/MCarlomagno/hermes-pubky"
+  --homepage "https://github.com/MCarlomagno/hermes-pubky-memory"
 ```
 
-## 2. Commit and push
+## 2. Commit and push  ✅ done
 
 ```bash
 cd ~/repos/hermes-pubky
 git add -A
 git commit -m "feat: portable Hermes agent context over Pubky (v0.1.0)"
 git branch -M main
-git remote add origin git@github.com:MCarlomagno/hermes-pubky.git
+git remote add origin git@github.com:MCarlomagno/hermes-pubky-memory.git
 git push -u origin main
 ```
 
@@ -28,16 +28,18 @@ Pubky v0.11 testnet (with a Postgres service container), the Python suite on
 3.11/3.12/3.13, and the Hermes integration check. Let it go green before
 tagging.
 
-## 3. Configure PyPI trusted publishing
+## 3. Configure PyPI trusted publishing  ← you are here
 
 No API token is stored in the repository — the release workflow authenticates
 with OIDC. Create the publisher **before** tagging:
 
 1. Go to <https://pypi.org/manage/account/publishing/>.
-2. Add a new pending publisher:
+2. Add a new pending publisher. These must match exactly — the repository is
+   named `hermes-pubky-memory` while the PyPI package is `hermes-pubky`, and a
+   mismatch here fails the release with an OIDC error:
    - PyPI project name: `hermes-pubky`
    - Owner: `MCarlomagno`
-   - Repository name: `hermes-pubky`
+   - Repository name: `hermes-pubky-memory`
    - Workflow name: `release.yml`
    - Environment name: `pypi`
 3. In the GitHub repo, create an environment named `pypi`
