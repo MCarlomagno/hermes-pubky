@@ -28,7 +28,7 @@ Pubky v0.11 testnet (with a Postgres service container), the Python suite on
 3.11/3.12/3.13, and the Hermes integration check. Let it go green before
 tagging.
 
-## 3. Configure PyPI trusted publishing  ← you are here
+## 3. Configure PyPI trusted publishing  ✅ done
 
 No API token is stored in the repository — the release workflow authenticates
 with OIDC. Create the publisher **before** tagging:
@@ -47,7 +47,7 @@ with OIDC. Create the publisher **before** tagging:
    yourself (Settings → Environments → New environment, named `pypi`) only if
    you want a required reviewer as a manual gate before each publish.
 
-## 4. Tag the release
+## 4. Tag the release  ← you are here
 
 ```bash
 git tag -a v0.1.0 -m "hermes-pubky v0.1.0"
@@ -56,9 +56,9 @@ git push origin v0.1.0
 
 The `Release` workflow then:
 
-1. builds wheels on native runners for macOS arm64, macOS x86_64,
-   manylinux2014 x86_64 and manylinux2014 aarch64 (one abi3 wheel each,
-   covering Python 3.11–3.13),
+1. builds a macOS `universal2` wheel (arm64 + x86_64 in one binary) and
+   manylinux2014 wheels for x86_64 and aarch64 — abi3, so each one covers
+   Python 3.11–3.13,
 2. smoke-tests every wheel with `scripts/smoke_test.py`,
 3. builds an sdist,
 4. publishes to PyPI via trusted publishing,
@@ -80,3 +80,15 @@ uv pip install --python /tmp/verify/bin/python hermes-pubky==0.1.0 && \
   with a compiled extension.
 - **Windows wheels** — out of scope for v0.1.
 - **Publishing public contexts** — v0.1 reads them only.
+
+## Note on macOS wheels
+
+GitHub retired `macos-13`, the last x86_64 macOS runner image; only arm64
+images (`macos-14/15/26`) are published now. A job targeting `macos-13` does
+not fail — it queues indefinitely. Intel macOS wheels are therefore built by
+cross-compiling a `universal2` binary from an arm64 runner, which has the
+added benefit that the smoke test actually executes the artifact we ship
+(the runner loads the arm64 slice).
+
+Every job now carries `timeout-minutes`, so a runner that can never be
+allocated fails in under an hour instead of hanging for six.
