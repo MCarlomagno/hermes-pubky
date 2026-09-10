@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 from . import __version__
+from .journal import LockUnavailable
 from .paths import (
     GRANT_ENV,
     NETWORK_MAINNET,
@@ -154,6 +155,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# -- network -----------------------------------------------------------------
+
+def select_network(network: str) -> None:
+    """Point the native SDK at the chosen network.
+
+    The SDK reads `HERMES_PUBKY_TESTNET` once, when first used, so this runs
+    before any command touches it. The flag is authoritative: a stale variable
+    must not send a mainnet agent to a testnet or the reverse.
+    """
+    import os
+
+    from .paths import NETWORK_TESTNET, TESTNET_ENV
+
+    if network == NETWORK_TESTNET:
+        os.environ[TESTNET_ENV] = "1"
+    else:
+        os.environ.pop(TESTNET_ENV, None)
+
+
 # -- resolution --------------------------------------------------------------
 
 def resolve_layout(args: Any, agent_id: str) -> Layout:
@@ -287,25 +307,23 @@ def cmd_login(args: Any) -> int:
 
 
 def cmd_logout(args: Any) -> int:
+    from .storage import AgentRemote
+
     layout = resolve_layout(args, args.agent_id)
     grant = grant_of(layout)
     if not grant:
         print("\n  Already logged out.\n")
         return EXIT_OK
-    revoked = "not attempted"
     try:
-        from .storage import native
-
-        session = native()
-        # Restoring and revoking uses the session's own endpoint, which a
-        # scoped grant is permitted to call.
-        transport = session.AgentTransport.open(grant, layout.owner, layout.agent_id)
-        del transport
-        revoked = "revoked at the homeserver"
+        AgentRemote.connect(grant, layout.owner, layout.agent_id).revoke()
     except Exception as exc:  # noqa: BLE001
-        revoked = f"could not revoke remotely ({exc})"
+        write_env_file(layout.credentials_file, {})
+        print(f"\n  Local grant deleted, but it could not be revoked at the "
+              f"homeserver ({exc}).")
+        print("  It stays valid until you revoke it in Pubky Ring.\n")
+        return EXIT_SAVED_LOCALLY
     write_env_file(layout.credentials_file, {})
-    print(f"\n  Local grant deleted; {revoked}.")
+    print("\n  Grant revoked at the homeserver and deleted locally.")
     print("  The working copy and cache were kept.\n")
     return EXIT_OK
 
@@ -328,42 +346,42 @@ def cmd_run(args: Any) -> int:
 
 
 def cmd_sync(args: Any) -> int:
-    from .journal import Journal
-    from .objects import ObjectCache
-    from .storage import AgentRemote
-    from .sync import SyncEngine
+    from .supervisor import Supervisor
 
     layout = resolve_layout(args, args.agent_id)
-    grant = require_grant(layout)
-    layout.ensure()
-    journal = Journal(layout.journal_file)
-    try:
-        engine = SyncEngine(
-            journal, AgentRemote.connect(grant, layout.owner, layout.agent_id),
-            ObjectCache(layout.cached_objects), recovery_dir=layout.recovery)
-        result = engine.resolve(args.prefer) if args.prefer else engine.sync_with_retries()
-    finally:
-        journal.close()
+    require_grant(layout)
+    with Supervisor(layout, network=args.network).session() as supervisor:
+        result = supervisor.sync(prefer=args.prefer)
     print(f"\n  {result.status}: {result.detail}\n")
-    return {"synced": EXIT_OK, "up-to-date": EXIT_OK, "conflict": EXIT_CONFLICT,
-            "blocked": EXIT_INTEGRITY}.get(result.status, EXIT_SAVED_LOCALLY)
+    if result.status == "blocked":
+        from .supervisor import blocked_exit_code
+
+        return blocked_exit_code(result.detail)
+    return {"synced": EXIT_OK, "up-to-date": EXIT_OK,
+            "conflict": EXIT_CONFLICT}.get(result.status, EXIT_SAVED_LOCALLY)
 
 
 def cmd_files(args: Any) -> int:
     from .files import files_command
+    from .supervisor import Supervisor
 
     layout = resolve_layout(args, args.agent_id)
-    return files_command(layout, args)
+    with Supervisor(layout, network=args.network).session() as supervisor:
+        return files_command(supervisor, args)
 
 
 def cmd_history(args: Any) -> int:
     from .storage import AgentRemote
 
+    from .journal import ConnectionLock
+
     layout = resolve_layout(args, args.agent_id)
     grant = require_grant(layout)
-    remote = AgentRemote.connect(grant, layout.owner, layout.agent_id)
-    ids, cursor = remote.list_snapshots(args.cursor, min(max(args.limit, 1), 200))
-    head = remote.read_head()
+    # One session per grant: never open one beside a running agent's.
+    with ConnectionLock(layout.lock_file):
+        remote = AgentRemote.connect(grant, layout.owner, layout.agent_id)
+        ids, cursor = remote.list_snapshots(args.cursor, min(max(args.limit, 1), 200))
+        head = remote.read_head()
     print(f"\nCheckpoints for {layout.agent_id}\n" + "-" * 44)
     for snapshot_id in ids:
         marker = "  <- current" if head and head.snapshot_id == snapshot_id else ""
@@ -376,10 +394,12 @@ def cmd_history(args: Any) -> int:
 
 def cmd_restore(args: Any) -> int:
     from .restore import restore_snapshot
+    from .supervisor import Supervisor
 
     layout = resolve_layout(args, args.agent_id)
     require_grant(layout)
-    return restore_snapshot(layout, args.snapshot_id, network=args.network)
+    with Supervisor(layout, network=args.network).session() as supervisor:
+        return restore_snapshot(supervisor, args.snapshot_id)
 
 
 def cmd_template(args: Any) -> int:
@@ -400,6 +420,7 @@ AGENT_COMMANDS = {
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    select_network(args.network)
     try:
         if args.command == "run":
             return cmd_run(args)
@@ -419,6 +440,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     except Abort as exc:
         print(f"\n  {exc}\n", file=sys.stderr)
         return exc.code
+    except LockUnavailable as exc:
+        print(f"\n  {exc}\n", file=sys.stderr)
+        return EXIT_USAGE
     except KeyboardInterrupt:
         print("\n  Cancelled.\n", file=sys.stderr)
         return EXIT_USAGE

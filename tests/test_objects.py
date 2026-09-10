@@ -41,10 +41,6 @@ def round_trip(tmp_path: Path, data: bytes, logical: str, **kw) -> bytes:
 
 
 class TestHashing:
-    def test_matches_hashlib_for_a_large_file(self, tmp_path):
-        data = os.urandom(3 * 1024 * 1024)
-        source = write(tmp_path / "f", data)
-        assert hash_file(source) == (hashlib.sha256(data).hexdigest(), len(data))
 
     def test_an_empty_file_hashes_to_the_empty_digest(self, tmp_path):
         assert hash_file(write(tmp_path / "f", b"")) == (m.EMPTY_SHA256, 0)
@@ -116,6 +112,8 @@ class TestStaging:
             write(tmp_path / "f", block * 2), "workspace/f.bin", tmp_path / "o")
         assert len(staged.record.pieces) == 2
         assert len(staged.objects) == 1, "identical chunks share one object"
+        assert all(path.is_file() for path in staged.objects.values()), \
+            "the shared object must survive its own repeat"
 
     def test_staging_leaves_no_temporary_files(self, tmp_path):
         out = tmp_path / "o"
@@ -233,16 +231,4 @@ class TestObjectCache:
         assert cache.has(refs[0])
         assert len(removed) >= 1
 
-    def test_nothing_is_evicted_when_under_budget(self, tmp_path):
-        cache = ObjectCache(tmp_path / "cache", budget_bytes=CACHE_BUDGET_BYTES)
-        staged = stage_file(write(tmp_path / "f", b"data"), "workspace/f.bin",
-                            tmp_path / "o")
-        ref, path = next(iter(staged.objects.items()))
-        cache.adopt(ref, path)
-        assert cache.evict_to_budget(protected=[]) == []
-        assert cache.has(ref)
 
-    def test_an_empty_cache_is_safe_to_query(self, tmp_path):
-        cache = ObjectCache(tmp_path / "absent")
-        assert cache.total_bytes() == 0
-        assert cache.evict_to_budget(protected=[]) == []

@@ -2,7 +2,8 @@
 
 A saved workspace file is only ever created, fetched or removed through the
 inventory, so the absence of a never-fetched file is never read as a deletion
-and a fetch never overwrites uncheckpointed local work.
+and a fetch never overwrites uncheckpointed local work. Every command runs
+inside a supervisor session, under the same lock a running agent holds.
 
 Reference: implementation plan section 11.
 """
@@ -13,39 +14,28 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from .journal import Journal, MaterializedFile
-from .models import SchemaError, Snapshot, normalize_new_path
-from .objects import ObjectCache
-from .paths import GRANT_ENV, Layout, read_env_file
-from .projection import (
-    Ignore,
-    Projection,
-    excluded_reason,
-    looks_like_private_key,
-)
-from .supervisor import EXIT_AUTH, EXIT_INTEGRITY, EXIT_OK, EXIT_USAGE
+from .models import SchemaError, normalize_new_path
+from .paths import GRANT_ENV, read_env_file
+from .projection import Ignore, excluded_reason, looks_like_private_key
+from .supervisor import EXIT_AUTH, EXIT_INTEGRITY, EXIT_OK, EXIT_USAGE, Supervisor
 
 
-def files_command(layout: Layout, args: Any) -> int:
+def files_command(supervisor: Supervisor, args: Any) -> int:
     command = getattr(args, "files_command", None)
-    layout.ensure()
-    journal = Journal(layout.journal_file)
-    try:
-        if command == "list":
-            return _list(layout, journal, getattr(args, "prefix", "") or "")
-        if command == "fetch":
-            return _fetch(layout, journal, args)
-        if command == "import":
-            return _import(layout, journal, args)
-        if command == "remove":
-            return _remove(layout, journal, args.relative_path)
-        print("\n  Usage: hermes-pubky agent files <id> list|fetch|import|remove\n")
-        return EXIT_USAGE
-    finally:
-        journal.close()
+    if command == "list":
+        return _list(supervisor, getattr(args, "prefix", "") or "")
+    if command == "fetch":
+        return _fetch(supervisor, args)
+    if command == "import":
+        return _import(supervisor, args)
+    if command == "remove":
+        return _remove(supervisor, args.relative_path)
+    print("\n  Usage: hermes-pubky agent files <id> list|fetch|import|remove\n")
+    return EXIT_USAGE
 
 
-def _list(layout: Layout, journal: Journal, prefix: str) -> int:
+def _list(supervisor: Supervisor, prefix: str) -> int:
+    layout, journal = supervisor.layout, supervisor.journal
     rows = []
     for record in journal.list_materialized():
         if not record.logical_path.startswith("workspace/") or record.explicit_delete:
@@ -70,38 +60,16 @@ def _list(layout: Layout, journal: Journal, prefix: str) -> int:
     return EXIT_OK
 
 
-def _snapshot_and_projection(layout: Layout, journal: Journal):
-    from . import hermes_adapter as adapter
-    from .paths import DeviceIdentity
-
-    snapshot_id = journal.get_setting("cached_snapshot_id")
-    snapshot = None
-    if isinstance(snapshot_id, str):
-        path = layout.cached_snapshot(snapshot_id)
-        if path.is_file():
-            try:
-                snapshot = Snapshot.parse(path.read_bytes())
-            except SchemaError:
-                snapshot = None
-    projection = Projection(
-        layout, journal, ObjectCache(layout.cached_objects),
-        runtime=adapter.runtime_info(),
-        device_id=DeviceIdentity.load_or_create(layout.root).device_id)
-    return snapshot, projection
-
-
-def _fetch(layout: Layout, journal: Journal, args: Any) -> int:
-    from .storage import AgentRemote
-
-    grant = read_env_file(layout.credentials_file).get(GRANT_ENV, "")
-    if not grant:
+def _fetch(supervisor: Supervisor, args: Any) -> int:
+    layout, journal = supervisor.layout, supervisor.journal
+    if not read_env_file(layout.credentials_file).get(GRANT_ENV, ""):
         print(f"\n  Not authorized; run 'hermes-pubky agent login "
               f"{layout.agent_id}'.\n")
         return EXIT_AUTH
 
-    snapshot, projection = _snapshot_and_projection(layout, journal)
-    if snapshot is None:
-        print("\n  No saved snapshot is cached locally; run the agent once "
+    base = supervisor._base()  # noqa: SLF001 - same package
+    if base is None:
+        print("\n  No saved snapshot is known locally; run the agent once "
               "or 'agent sync' first.\n")
         return EXIT_INTEGRITY
 
@@ -115,41 +83,33 @@ def _fetch(layout: Layout, journal: Journal, args: Any) -> int:
             return EXIT_USAGE
         wanted = [f"workspace/{args.path.lstrip('/')}"]
 
-    missing = [p for p in wanted if p not in snapshot.files]
+    missing = [p for p in wanted if p not in base.files]
     if missing:
         print(f"\n  Not saved for this agent: {', '.join(missing)}\n")
         return EXIT_USAGE
-
     dirty = [p for p in wanted
-             if (journal.get_materialized(p) or MaterializedFile(p, "", False, False, False)).dirty]
+             if (record := journal.get_materialized(p)) is not None and record.dirty]
     if dirty:
         print(f"\n  These have local changes; fetching would overwrite them: "
               f"{', '.join(dirty)}\n")
         return EXIT_USAGE
 
-    remote = AgentRemote.connect(grant, layout.owner, layout.agent_id)
-    cache = ObjectCache(layout.cached_objects)
-    pieces = {piece.object: piece
-              for record in snapshot.files.values() for piece in record.pieces}
-
-    def resolve(reference: str) -> Path:
-        cached = cache.path_for(reference)
-        if cached.is_file():
-            return cached
-        cached.parent.mkdir(parents=True, exist_ok=True)
-        remote.read_object_to_path(pieces[reference], cached)
-        return cached
-
-    installed = projection.materialize(snapshot, resolve, extra_paths=wanted)
-    for logical in installed:
-        print(f"  fetched {logical[len('workspace/'):]}")
-    if not installed:
+    fetched = 0
+    for logical in wanted:
+        before = journal.get_materialized(logical)
+        supervisor.fetch_path(logical)
+        after = journal.get_materialized(logical)
+        if after is not None and after.present and not (before and before.present):
+            print(f"  fetched {logical[len('workspace/'):]}")
+            fetched += 1
+    if not fetched:
         print("  already present")
     print()
     return EXIT_OK
 
 
-def _import(layout: Layout, journal: Journal, args: Any) -> int:
+def _import(supervisor: Supervisor, args: Any) -> int:
+    layout, journal = supervisor.layout, supervisor.journal
     source = Path(args.local_path).expanduser()
     if not source.is_file():
         print(f"\n  {source} is not a file.\n")
@@ -180,11 +140,12 @@ def _import(layout: Layout, journal: Journal, args: Any) -> int:
     journal.mark_dirty(f"workspace/{relative}")
     journal.bump_generation()
     print(f"\n  Imported to {destination}.")
-    print("  It joins the agent's saved files at the next checkpoint.\n")
+    print("  It joins the agent's saved files at the next 'agent sync' or run.\n")
     return EXIT_OK
 
 
-def _remove(layout: Layout, journal: Journal, relative_path: str) -> int:
+def _remove(supervisor: Supervisor, relative_path: str) -> int:
+    layout, journal = supervisor.layout, supervisor.journal
     relative = relative_path.lstrip("/")
     logical = f"workspace/{relative}"
     record = journal.get_materialized(logical)
@@ -202,6 +163,6 @@ def _remove(layout: Layout, journal: Journal, relative_path: str) -> int:
     journal.mark_deleted(logical)
     journal.bump_generation()
     print(f"\n  {relative} will be removed from the agent's saved files at the "
-          "next checkpoint.")
+          "next 'agent sync' or run.")
     print("  Earlier checkpoints still contain it; this is not secure erasure.\n")
     return EXIT_OK

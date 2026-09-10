@@ -12,7 +12,15 @@ from __future__ import annotations
 import hashlib
 from typing import Any, Dict
 
-from .journal import Journal, JournalError
+from .journal import (
+    ACKNOWLEDGED_AT,
+    ACKNOWLEDGED_HEAD,
+    STATE_BLOCKED,
+    ConnectionLock,
+    Journal,
+    JournalError,
+    LockUnavailable,
+)
 from .paths import GRANT_ENV, Layout, read_env_file
 
 # The states a caller may branch on.
@@ -24,6 +32,7 @@ AUTH_REQUIRED = "auth-required"
 QUOTA_BLOCKED = "quota-blocked"
 CONFLICT = "conflict"
 CORRUPT = "corrupt"
+RUNNING = "running"
 
 
 def fingerprint(secret: str) -> str:
@@ -58,14 +67,14 @@ def agent_status(layout: Layout, network: str, *,
     try:
         active = journal.active_checkpoints()
         conflicts = journal.conflicted_checkpoints()
-        blocked = [c for c in active if c.state == "blocked"]
+        blocked = [c for c in active if c.state == STATE_BLOCKED]
         inventory = journal.list_materialized()
         pending_bytes = sum(
             u.size for c in active for u in journal.all_uploads(c.id)
             if not u.acknowledged)
         snapshot.update({
-            "checkpoint": journal.get_setting("acknowledged_head", {}) or {},
-            "lastSyncedAt": journal.get_setting("acknowledged_at", "") or "never",
+            "checkpoint": journal.get_setting(ACKNOWLEDGED_HEAD, {}) or {},
+            "lastSyncedAt": journal.get_setting(ACKNOWLEDGED_AT, "") or "never",
             "pendingCheckpoints": len(active),
             "pendingBytes": pending_bytes,
             "materialized": sum(1 for r in inventory if r.present),
@@ -84,6 +93,15 @@ def agent_status(layout: Layout, network: str, *,
             snapshot["state"] = AUTH_REQUIRED
             snapshot["detail"] = (
                 f"run 'hermes-pubky agent login {layout.agent_id}'")
+        elif blocked:
+            from .supervisor import EXIT_AUTH, EXIT_QUOTA, blocked_exit_code
+
+            code = blocked_exit_code(blocked[0].last_error)
+            snapshot["state"] = {EXIT_AUTH: AUTH_REQUIRED,
+                                 EXIT_QUOTA: QUOTA_BLOCKED}.get(code, CORRUPT)
+            snapshot["detail"] = (
+                f"{len(active)} checkpoint(s) saved locally but blocked: "
+                f"{blocked[0].last_error}")
         elif active:
             snapshot["state"] = DIRTY
             snapshot["detail"] = (
@@ -94,7 +112,22 @@ def agent_status(layout: Layout, network: str, *,
             snapshot["detail"] = "local changes have not been checkpointed"
 
         if check_remote and grant and snapshot["state"] not in (CONFLICT, CORRUPT):
-            _add_remote(snapshot, layout, grant)
+            # The homeserver keeps one session per grant: opening another
+            # here would revoke the one a running agent is using.
+            lock = ConnectionLock(layout.lock_file)
+            try:
+                lock.acquire()
+            except LockUnavailable:
+                snapshot["state"] = RUNNING
+                pid = lock.holder_pid()
+                snapshot["detail"] = ("an agent or command is using this connection"
+                                      + (f" (pid {pid})" if pid else ""))
+                snapshot["homeserver"] = "not checked while the connection is in use"
+            else:
+                try:
+                    _add_remote(snapshot, layout, grant)
+                finally:
+                    lock.release()
     finally:
         journal.close()
     return snapshot

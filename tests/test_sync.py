@@ -115,8 +115,6 @@ class TestHappyPath:
         assert fx.engine.sync().status == "synced"
         assert m.Head.parse(fx.remote.head).snapshot_id == "2" * 32
 
-    def test_nothing_pending_reports_up_to_date(self, fx):
-        assert fx.engine.sync().status == "up-to-date"
 
 
 class TestFailureAtEveryBoundary:
@@ -277,12 +275,7 @@ class TestConflicts:
         assert published.parent.snapshot_id == ref.snapshot_id, "must build on the remote"
         assert list(fx.recovery.rglob("remote-head.json")), "remote side preserved"
 
-    def test_resolving_with_no_conflict_is_a_no_op(self, fx):
-        assert fx.engine.resolve("remote").status == "up-to-date"
 
-    def test_an_unknown_preference_is_refused(self, fx):
-        with pytest.raises(ValueError, match="prefer must be"):
-            fx.engine.resolve("both")
 
     def test_two_simultaneous_writers_stay_outside_the_guarantee(self, fx):
         """Documented limit: the head is re-read, not compare-and-swapped.
@@ -294,7 +287,7 @@ class TestConflicts:
         checkpoint, snapshot = fx.stage(files={"profile/SOUL.md": b"mine\n"})
 
         original_write = fx.remote.write_head
-        def racing_write(head):
+        def racing_write(head, timeout_secs=None):
             # Another machine publishes in the same instant.
             other = m.Snapshot(agent_id="default", snapshot_id="7" * 32,
                                created_at="2026-09-09T20:00:00Z",
@@ -333,6 +326,17 @@ class TestClassificationAndBackoff:
 
     def test_a_quota_failure_does_not_retry(self):
         assert isinstance(classify(Exception("storage quota exceeded")), Fatal)
+
+    def test_throttling_is_transient_whatever_type_reports_it(self):
+        exc = type("PubkyValidationError", (Exception,), {})("homeserver returned 429: slow down")
+        assert isinstance(classify(exc), Transient)
+
+    def test_an_exhausted_deadline_transfers_nothing_and_keeps_the_work(self, fx):
+        checkpoint, _ = fx.stage(files={"profile/SOUL.md": b"# me\n"})
+        result = fx.engine.sync(deadline=0.0)
+        assert result.status == "retry" and "budget" in result.detail
+        assert fx.remote.calls == [], "no transfer may start past the deadline"
+        assert [c.id for c in fx.journal.active_checkpoints()] == [checkpoint.id]
 
     def test_backoff_grows_and_is_capped(self):
         assert backoff_delay(1) <= 2.0

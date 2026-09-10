@@ -26,6 +26,8 @@ MANAGED_ENV = "HERMES_PUBKY_MANAGED"
 CONNECTION_ENV = "HERMES_PUBKY_CONNECTION"
 GRANT_ENV = "HERMES_PUBKY_GRANT_SECRET"
 HERMES_HOME_ENV = "HERMES_HOME"
+# Read once by the native SDK; set from --network before the first native call.
+TESTNET_ENV = "HERMES_PUBKY_TESTNET"
 TERMINAL_CWD_ENV = "TERMINAL_CWD"
 
 # Network partitions. Different testnet instances must use separate roots.

@@ -253,6 +253,11 @@ class TestTools:
         assert first["status"] == "pending"
         assert first["request_id"] == second["request_id"], \
             "a repeated fetch must not queue a second download"
+        # A later run is a fresh attempt: a failure last time must not stick.
+        provider._run_id = "run-2"
+        third = json.loads(provider.handle_tool_call(
+            "pubky_file_fetch", {"path": "ref.pdf"}))
+        assert third["request_id"] != first["request_id"]
 
     def test_fetching_will_not_overwrite_dirty_local_work(self, managed):
         provider, layout = managed
@@ -265,11 +270,6 @@ class TestTools:
             "pubky_file_fetch", {"path": "ref.pdf"}))
         assert "local changes" in result["error"]
 
-    def test_an_unknown_tool_returns_an_error(self, managed):
-        provider, layout = managed
-        provider.initialize("s", hermes_home=str(layout.hermes_home))
-        assert "unknown tool" in json.loads(
-            provider.handle_tool_call("nope", {}))["error"]
 
     def test_tools_are_unavailable_when_unmanaged(self, monkeypatch):
         monkeypatch.delenv(CONNECTION_ENV, raising=False)

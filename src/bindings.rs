@@ -205,6 +205,27 @@ impl AgentTransport {
         Ok((page.snapshot_ids, page.next_cursor))
     }
 
+    /// Revoke this grant at the homeserver. The transport is unusable after.
+    ///
+    /// Uses the session's own signout, which a scoped grant may call. Success
+    /// means the homeserver no longer accepts the secret; a failure is raised
+    /// so the caller never reports a revocation that did not happen.
+    #[pyo3(signature = (timeout_secs = 10.0))]
+    fn revoke(&mut self, py: Python<'_>, timeout_secs: f64) -> PyResult<()> {
+        let actor = std::mem::replace(&mut self.actor, Actor::Public);
+        let session = match actor {
+            Actor::Session(session) => session,
+            Actor::Public => {
+                return Err(crate::errors::NativeError::validation(
+                    "this transport holds no session to revoke",
+                )
+                .into())
+            }
+        };
+        py.detach(move || block_on(timeout_secs, session_ops::revoke(session)))?;
+        Ok(())
+    }
+
     fn __repr__(&self) -> String {
         format!("<AgentTransport {}>", self.root)
     }

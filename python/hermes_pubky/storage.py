@@ -182,6 +182,10 @@ class AgentRemote:
                 f"({digest}/{size} vs {piece.sha256}/{piece.size})")
         return self._transport.object_put(piece.object, str(source), timeout_secs)
 
+    def revoke(self, timeout_secs: float = 10.0) -> None:
+        """Revoke this grant at the homeserver. The remote is unusable after."""
+        self._transport.revoke(timeout_secs)
+
     def __repr__(self) -> str:
         return f"<AgentRemote {self.owner}/{self.agent_id}>"
 

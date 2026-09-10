@@ -45,9 +45,10 @@ hermes-pubky agent attach pubky://<owner>/priv/hermes.pubky.app/v2/agents/defaul
 hermes-pubky run default
 ```
 
-Nothing is copied between machines. Instructions, memories, skills, settings and
-conversations come back from the homeserver; workspace documents are fetched
-when the agent asks for them.
+Nothing is copied between machines. `attach` downloads the instructions,
+memories, skills, settings and conversation database; workspace documents are
+fetched when the agent asks for them. Every run saves a checkpoint when it ends,
+and the next run on any machine starts from the newest one.
 
 ## Commands
 
@@ -70,6 +71,10 @@ hermes-pubky template adopt <agent-id> <pubky-uri>
 hermes-pubky template update <agent-id>
 ```
 
+`agent sync` seals whatever changed locally, including files added by hand or
+with `agent files import`, then publishes everything pending. `agent logout`
+revokes the grant at the homeserver and says so only when that succeeded.
+
 Exit codes: 0 done, 1 usage, 2 saved locally but not yet on the homeserver,
 3 conflict, 4 authorization needed, 5 quota, 6 integrity or unsupported runtime.
 
@@ -89,6 +94,10 @@ Hermes child's environment entirely.
 Publishing a template needs its own separate capability under `/pub/`. An
 agent's grant can never publish.
 
+A grant holds one session at a time. Authorize each computer with its own
+`agent login` rather than copying a grant between machines, or each will keep
+signing the other out.
+
 ## Read this before you store anything
 
 Your homeserver operator can read your agent. `/priv` is access-controlled, not
@@ -98,14 +107,18 @@ Credentials are never uploaded, but a conversation can contain anything you or a
 tool put in it.
 
 One writer at a time. Read from as many machines as you like, but stop and sync
-on one before writing from another. If the remote checkpoint moves while you
-have unsaved work, syncing stops and asks you to choose with `--prefer`;
-whichever side you drop is preserved under `recovery/` first.
+on one before writing from another. If the homeserver's checkpoint moved while
+this machine has unsaved work, `run` stops before starting the agent, installs
+nothing over your work, and asks you to choose with `agent sync --prefer
+local|remote`; whichever side you drop is preserved under `recovery/` first.
 
-Offline works. Startup reads the local working copy, then refreshes with a
-five-second budget. Changes are sealed into local checkpoints that survive
-restarts and retry with backoff capped at 60 seconds. A run that could not reach
-the homeserver exits 2 and says `saved locally; not yet saved to homeserver`.
+Offline works. Startup seals anything a previous run left unsaved, then refreshes
+from the homeserver with a five-second budget. Offline runs chain their
+checkpoints, survive restarts, and publish in order at the next sync, retrying
+with backoff capped at 60 seconds. A run that could not reach the homeserver
+exits 2 and says `saved locally; not yet saved to homeserver`. A run whose
+conversation database cannot be captured exits 6 and does not claim anything
+was saved.
 
 A cold attach downloads the conversation database in full. It is streamed and
 reassembled on disk, never held in memory, but a large history takes time.
@@ -131,9 +144,15 @@ hermes-pubky run <id>
 ```
 
 Storage is content-addressed. A checkpoint is an immutable snapshot document
-naming immutable objects; only `head.json` is mutable, and it moves last. The
-homeserver offers no conditional write, so this is ordering, not a lock:
-concurrent writers remain unsupported and are detected rather than merged.
+naming immutable objects; only `head.json` is mutable, and it moves last, after
+every object it names has been verified as recorded. The homeserver offers no
+conditional write, so this is ordering, not a lock: concurrent writers remain
+unsupported and are detected rather than merged.
+
+Locally, the journal tracks one *base*: the checkpoint the working copy
+corresponds to. Sealing a checkpoint advances it, installing one advances it,
+publishing never does. That is what lets a second run continue the first and
+offline runs form a chain.
 
 ```text
 /priv/hermes.pubky.app/v2/agents/<id>/{head,snapshots/*,objects/*}.json
@@ -155,6 +174,12 @@ PYO3_PYTHON="$PWD/.venv/bin/python" .venv/bin/maturin develop
 cargo test --lib        # Rust unit tests
 ```
 
+`tests/test_supervisor.py` runs the whole launcher against a fake homeserver
+and a stand-in child: two runs in a row, an attach on a second machine, offline
+chains, a moved head over local edits, a corrupt database, a failed restore.
+Those are the scenarios that matter; the rest of the suite guards the wire
+format and the policy boundaries.
+
 The end-to-end and acceptance suites need PostgreSQL for the homeserver and the
 well-known testnet ports free:
 
@@ -174,7 +199,8 @@ needed:
 python scripts/check_managed_hermes_integration.py
 ```
 
-The full recovery scenario, one agent across two machines:
+The full recovery scenario through the shipped command line, one agent across
+two machines, ending with the grant revoked (so each run needs a fresh fixture):
 
 ```bash
 cargo run --example testnet_fixture > /tmp/fixture.json &

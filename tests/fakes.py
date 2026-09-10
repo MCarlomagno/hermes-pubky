@@ -62,33 +62,43 @@ class FakeAgentRemote:
             raise LostResponse(f"response lost after {boundary}")
 
     # -- protocol ----------------------------------------------------------
+    #
+    # Every call accepts the timeout the engine hands it; the fake ignores it.
 
-    def read_head(self) -> Optional[Head]:
+    def read_head(self, timeout_secs=None) -> Optional[Head]:
         self._maybe_fail("read_head")
         return Head.parse(self.head) if self.head else None
 
-    def write_head(self, head: Head) -> None:
+    def write_head(self, head: Head, timeout_secs=None) -> None:
         self._maybe_fail("write_head")
         self.head = head.to_bytes()
         self._maybe_lose("write_head")
 
-    def read_snapshot(self, ref: SnapshotRef) -> Snapshot:
+    def read_snapshot(self, ref: SnapshotRef, timeout_secs=None) -> Snapshot:
         self._maybe_fail("read_snapshot")
         return Snapshot.parse(self.snapshots[ref.snapshot_id])
 
-    def put_snapshot(self, snapshot: Snapshot) -> SnapshotRef:
+    def put_snapshot(self, snapshot: Snapshot, timeout_secs=None) -> SnapshotRef:
         self._maybe_fail("put_snapshot")
         body = snapshot.to_bytes()
         self.snapshots[snapshot.snapshot_id] = body
         self._maybe_lose("put_snapshot")
         return SnapshotRef(snapshot_id=snapshot.snapshot_id, sha256=hash_bytes(body))
 
-    def put_object_from_path(self, piece, source: Path) -> int:
+    def put_object_from_path(self, piece, source: Path, timeout_secs=None) -> int:
         self._maybe_fail(f"put_object:{piece.object}")
         data = Path(source).read_bytes()
         self.objects[piece.object] = data
         self._maybe_lose(f"put_object:{piece.object}")
         return len(data)
+
+    def read_object_to_path(self, piece, destination: Path, timeout_secs=None) -> int:
+        self._maybe_fail(f"get_object:{piece.object}")
+        if piece.object not in self.objects:
+            raise KeyError(f"{piece.object} is not on the homeserver")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(self.objects[piece.object])
+        return len(self.objects[piece.object])
 
     # -- helpers for assertions -------------------------------------------
 

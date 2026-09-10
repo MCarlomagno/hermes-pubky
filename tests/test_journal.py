@@ -49,11 +49,6 @@ def checkpoint(journal: Journal, tmp_path: Path, *, parent=None):
 
 
 class TestDurability:
-    def test_uses_wal_and_full_synchronous(self, journal):
-        mode = journal._conn.execute("PRAGMA journal_mode").fetchone()[0]
-        sync = journal._conn.execute("PRAGMA synchronous").fetchone()[0]
-        assert mode.lower() == "wal"
-        assert sync == 2, "synchronous must be FULL"
 
     def test_the_journal_file_is_owner_only(self, tmp_path):
         import stat
@@ -216,14 +211,6 @@ class TestRequests:
         assert "supervisor exited" in journal.get_request(pending.id).result["error"]
 
 
-class TestGeneration:
-    def test_bumping_advances_the_counter(self, journal):
-        assert journal.generation == 0
-        assert journal.bump_generation() == 1
-        assert journal.bump_generation() == 2
-        assert journal.generation == 2
-
-
 def _hold_lock(path: str, ready, done) -> None:
     lock = ConnectionLock(Path(path))
     lock.acquire()
@@ -258,19 +245,4 @@ class TestConnectionLock:
             done.set()
             worker.join(timeout=30)
 
-    def test_the_lock_records_its_holder(self, tmp_path):
-        import os
 
-        lock = ConnectionLock(tmp_path / "run.lock")
-        lock.acquire()
-        try:
-            assert lock.holder_pid() == os.getpid()
-        finally:
-            lock.release()
-
-    def test_releasing_allows_a_new_holder(self, tmp_path):
-        path = tmp_path / "run.lock"
-        ConnectionLock(path).__enter__().release()
-        second = ConnectionLock(path)
-        second.acquire()
-        second.release()

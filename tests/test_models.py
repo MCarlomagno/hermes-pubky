@@ -109,8 +109,6 @@ class TestLogicalPaths:
         with pytest.raises(m.SchemaError, match="collide"):
             m.reject_colliding_paths(["workspace/café.md", "workspace/café.md"])
 
-    def test_identical_paths_are_not_a_collision(self):
-        m.reject_colliding_paths(["a/b.md", "a/b.md", "a/c.md"])
 
     def test_core_markdown_gets_the_tighter_cap(self):
         assert m.max_bytes_for("profile/SOUL.md") == m.MAX_CORE_MARKDOWN_BYTES

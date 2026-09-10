@@ -13,11 +13,13 @@ Reference: implementation plan section 8 and ADR 0002.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import shutil
 import sqlite3
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional
 
 from .models import DATABASE_PATH, FileRecord, SchemaError
 from .objects import ObjectCache, assemble, stage_file
@@ -58,11 +60,31 @@ class UnsupportedDatabase(SchemaError):
     """The database is not the schema this adapter was validated against."""
 
 
-def capture_database(layout: Layout, cache: ObjectCache
-                     ) -> Optional[Tuple[FileRecord, Dict[str, Path]]]:
+@dataclass
+class CapturedDatabase:
+    """A normalized, chunked copy of the conversation and its logical digest."""
+
+    record: FileRecord
+    objects: Dict[str, Path]
+    # Over durable rows only, so two captures of the same conversation compare
+    # equal even though SQLite rewrote page headers in between.
+    digest: str
+
+
+@dataclass
+class StagedDatabase:
+    """A verified, rebased database waiting to replace the live one."""
+
+    path: Path
+    digest: str
+
+
+def capture_database(layout: Layout, cache: ObjectCache) -> Optional[CapturedDatabase]:
     """Take a consistent snapshot of the conversation database.
 
-    Returns `(record, staged_objects)`, or None when there is no database yet.
+    Returns None only when there is no database at all. A database that exists
+    but cannot be captured raises, so a failed capture is never mistaken for a
+    conversation that does not exist.
     """
     source = layout.state_db
     if not source.is_file():
@@ -74,38 +96,41 @@ def capture_database(layout: Layout, cache: ObjectCache
     staging.mkdir(parents=True, exist_ok=True)
     working = staging / "state.sqlite3"
 
-    _online_backup(source, working)
+    copy_database(source, working)
     _assert_supported(working)
     _normalize(working, layout)
     _verify_integrity(working)
+    digest = logical_digest(working)
 
     staged = stage_file(working, DATABASE_PATH, staging / "objects",
                         force_chunked=True)
-    return staged.record, staged.objects
+    return CapturedDatabase(record=staged.record, objects=staged.objects,
+                            digest=digest)
 
 
-def _online_backup(source: Path, destination: Path) -> None:
-    """Copy the database through SQLite's backup API.
+def copy_database(source: Path, destination: Path) -> None:
+    """Copy a database through SQLite's backup API.
 
     Reading the file directly would miss committed WAL data and could capture a
-    torn page. The WAL and SHM sidecars are never uploaded on their own.
+    torn page. The WAL and SHM sidecars are never copied on their own.
     """
     try:
         origin = sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=5.0)
     except sqlite3.Error as exc:
         raise UnsupportedDatabase(f"cannot open {source}: {exc}") from exc
     try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
         target = sqlite3.connect(destination)
         try:
             origin.backup(target)
-            # DELETE mode leaves a single self-contained file, so the snapshot
-            # does not depend on sidecars that were never uploaded.
+            # DELETE mode leaves a single self-contained file, so the copy
+            # does not depend on sidecars that were never transferred.
             target.execute("PRAGMA journal_mode=DELETE")
             target.commit()
         finally:
             target.close()
     except sqlite3.Error as exc:
-        raise UnsupportedDatabase(f"backup failed: {exc}") from exc
+        raise UnsupportedDatabase(f"backup of {source} failed: {exc}") from exc
     finally:
         origin.close()
 
@@ -205,10 +230,9 @@ def logical_digest(path: Path) -> str:
 
     SQLite rewrites header counters and page layout on every write, so file
     hashes change when nothing meaningful did. This compares the data instead,
-    which is what decides whether a new checkpoint is worth uploading.
+    which is what decides whether a new checkpoint is worth uploading. Run on
+    the normalized copy, so the result is the same on every machine.
     """
-    import hashlib
-
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     digest = hashlib.sha256()
     try:
@@ -216,8 +240,6 @@ def logical_digest(path: Path) -> str:
             columns = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
             if not columns:
                 continue
-            # Exclude nothing here: normalization already removed the
-            # device-specific fields before this runs.
             names = ", ".join(f'"{c}"' for c in columns)
             key = "id" if "id" in columns else columns[0]
             digest.update(f"table:{table}:{names}\n".encode("utf-8"))
@@ -229,13 +251,12 @@ def logical_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def restore_database(record: FileRecord, resolve: Callable[[str], Path],
-                     layout: Layout) -> None:
-    """Rebuild `state.db` from a snapshot's chunks.
+def stage_database(record: FileRecord, resolve: Callable[[str], Path],
+                   layout: Layout) -> StagedDatabase:
+    """Rebuild a snapshot's database beside the live one, fully verified.
 
-    The staging copy is verified, schema-checked and rebased before it replaces
-    anything, and the previous database is kept until the swap succeeds. Never
-    called while a child is running.
+    Nothing the child reads is touched: the result waits for `install_database`
+    so a restore can verify every file first and then commit them together.
     """
     staging = layout.staging / "restore"
     staging.mkdir(parents=True, exist_ok=True)
@@ -245,18 +266,32 @@ def restore_database(record: FileRecord, resolve: Callable[[str], Path],
     assemble(record, resolve, candidate)
     _assert_supported(candidate)
     _verify_integrity(candidate)
+    # The digest is taken before rebasing, on the same bytes the other machine
+    # digested when it captured them.
+    digest = logical_digest(candidate)
     _rebase(candidate, layout)
+    return StagedDatabase(path=candidate, digest=digest)
 
+
+def install_database(staged: StagedDatabase, layout: Layout) -> None:
+    """Replace the live database with a staged one. Never while a child runs."""
     target = layout.state_db
-    previous = staging / "previous-state.db"
+    previous = staged.path.with_name("previous-state.db")
     if target.is_file():
         shutil.copy2(target, previous)
     # Same-filesystem rename, and the old WAL/SHM sidecars are dropped rather
     # than left to be reused against a different database.
     for suffix in ("-wal", "-shm"):
-        sidecar = target.with_name(target.name + suffix)
-        sidecar.unlink(missing_ok=True)
-    candidate.replace(target)
+        target.with_name(target.name + suffix).unlink(missing_ok=True)
+    staged.path.replace(target)
+
+
+def restore_database(record: FileRecord, resolve: Callable[[str], Path],
+                     layout: Layout) -> str:
+    """Stage and install in one step. Returns the logical digest."""
+    staged = stage_database(record, resolve, layout)
+    install_database(staged, layout)
+    return staged.digest
 
 
 def _rebase(path: Path, layout: Layout) -> None:

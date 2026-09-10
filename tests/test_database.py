@@ -66,7 +66,7 @@ class TestCapture:
 
         captured = capture_database(layout, ObjectCache(layout.cached_objects))
         assert captured is not None
-        record, objects = captured
+        record, objects = captured.record, captured.objects
         assert record.size > 0
         assert all(p.object.endswith(".chunk") for p in record.pieces), \
             "the database is always chunked"
@@ -205,7 +205,8 @@ class TestRestore:
         before = _durable_rows(layout.state_db)
 
         cache = ObjectCache(layout.cached_objects)
-        record, objects = capture_database(layout, cache)
+        captured = capture_database(layout, cache)
+        record, objects = captured.record, captured.objects
 
         # Wipe the working database, then restore from the staged objects.
         layout.state_db.unlink()
@@ -219,7 +220,8 @@ class TestRestore:
         layout = make_layout(tmp_path)
         shutil.copy2(build_real_database(tmp_path), layout.state_db)
         cache = ObjectCache(layout.cached_objects)
-        record, objects = capture_database(layout, cache)
+        captured = capture_database(layout, cache)
+        record, objects = captured.record, captured.objects
         layout.state_db.unlink()
         restore_database(record, lambda ref: objects[ref], layout)
 
@@ -251,7 +253,8 @@ class TestRestore:
         conn.close()
 
         cache = ObjectCache(layout.cached_objects)
-        record, objects = capture_database(layout, cache)
+        captured = capture_database(layout, cache)
+        record, objects = captured.record, captured.objects
 
         # Restore into a different workspace, as a second machine would.
         other = Layout(root=tmp_path / "root2", network="testnet", owner=OWNER,
@@ -270,7 +273,8 @@ class TestRestore:
         layout = make_layout(tmp_path)
         shutil.copy2(build_real_database(tmp_path), layout.state_db)
         cache = ObjectCache(layout.cached_objects)
-        record, objects = capture_database(layout, cache)
+        captured = capture_database(layout, cache)
+        record, objects = captured.record, captured.objects
 
         # A leftover WAL from a different database must not survive the swap.
         wal = layout.state_db.with_name(layout.state_db.name + "-wal")
@@ -289,7 +293,8 @@ class TestRestore:
         conn.close()
 
         cache = ObjectCache(layout.cached_objects)
-        record, objects = capture_database(layout, cache)
+        captured = capture_database(layout, cache)
+        record, objects = captured.record, captured.objects
         other = Layout(root=tmp_path / "root2", network="testnet", owner=OWNER,
                        agent_id="default").ensure()
         restore_database(record, lambda ref: objects[ref], other)
@@ -302,6 +307,29 @@ class TestRestore:
             conn.close()
         assert str(layout.workspace) in text, \
             "historical text is a record of what happened, not a path to rewrite"
+
+
+class TestCopy:
+    def test_committed_wal_rows_are_copied(self, tmp_path):
+        from hermes_pubky.database import copy_database
+
+        source = tmp_path / "source.db"
+        origin = sqlite3.connect(source)
+        origin.execute("PRAGMA journal_mode=WAL")
+        origin.execute("CREATE TABLE proof (value TEXT)")
+        origin.commit()
+        origin.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        origin.execute("INSERT INTO proof VALUES ('committed, still in the WAL')")
+        origin.commit()  # not checkpointed: a plain file copy would miss it
+        try:
+            copy_database(source, tmp_path / "copy.db")
+        finally:
+            origin.close()
+        copied = sqlite3.connect(tmp_path / "copy.db")
+        try:
+            assert copied.execute("SELECT COUNT(*) FROM proof").fetchone()[0] == 1
+        finally:
+            copied.close()
 
 
 def _durable_rows(path: Path) -> dict:

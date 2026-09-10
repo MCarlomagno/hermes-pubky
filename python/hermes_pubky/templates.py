@@ -11,11 +11,12 @@ Reference: implementation plan section 12.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from . import hermes_adapter as adapter
 from .journal import Journal, new_id, utcnow
@@ -29,18 +30,17 @@ from .models import (
     TemplateOrigin,
     TemplateSnapshot,
 )
-from .objects import ObjectCache, assemble, stage_file
+from .objects import ObjectCache, assemble, hash_bytes, stage_file
 from .paths import (
     GRANT_ENV,
-    DeviceIdentity,
     Layout,
     read_env_file,
     template_dir,
     write_env_file,
     write_private,
 )
-from .projection import NoChange, Projection
-from .storage import AgentRemote, PublicTemplateRemote, TemplatePublisher, native
+from .projection import NoChange
+from .storage import PublicTemplateRemote, TemplatePublisher, native
 from .supervisor import (
     EXIT_AUTH,
     EXIT_CONFLICT,
@@ -48,6 +48,9 @@ from .supervisor import (
     EXIT_OK,
     EXIT_USAGE,
 )
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .supervisor import Supervisor
 
 # The only logical paths a template may contain.
 BUNDLE_FILES = {
@@ -172,10 +175,14 @@ def template_command(args: Any, resolve: Callable[[str], Layout]) -> int:
         if command == "publish":
             return cmd_publish(Path(args.directory), args.template_id,
                                args.confirm_public, network=args.network)
-        if command == "adopt":
-            return cmd_adopt(resolve(args.agent_id), args.uri, network=args.network)
-        if command == "update":
-            return cmd_update(resolve(args.agent_id), network=args.network)
+        if command in ("adopt", "update"):
+            from .supervisor import Supervisor
+
+            layout = resolve(args.agent_id)
+            with Supervisor(layout, network=args.network).session() as supervisor:
+                if command == "adopt":
+                    return cmd_adopt(supervisor, args.uri)
+                return cmd_update(supervisor)
     except SchemaError as exc:
         _out(f"\n  {exc}\n")
         return EXIT_USAGE
@@ -298,10 +305,10 @@ def cmd_publish(directory: Path, template_id: str, confirm: Optional[str],
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def cmd_adopt(layout: Layout, uri: str, *, network: str) -> int:
+def cmd_adopt(supervisor: "Supervisor", uri: str) -> int:
     """Copy a reviewed template into a private agent as its own content."""
-    grant = read_env_file(layout.credentials_file).get(GRANT_ENV, "")
-    if not grant:
+    layout = supervisor.layout
+    if not read_env_file(layout.credentials_file).get(GRANT_ENV, ""):
         _out(f"\n  Not authorized; run 'hermes-pubky agent login "
              f"{layout.agent_id}'.\n")
         return EXIT_AUTH
@@ -314,134 +321,175 @@ def cmd_adopt(layout: Layout, uri: str, *, network: str) -> int:
     template = remote.read_snapshot(
         SnapshotRef(snapshot_id=head.snapshot_id, sha256=head.sha256))
 
-    layout.ensure()
-    journal = Journal(layout.journal_file)
-    try:
-        agent = AgentRemote.connect(grant, layout.owner, layout.agent_id)
-        current = _current_snapshot(journal, layout, agent)
+    base = _settled_base(supervisor)
+    if base is None:
+        return EXIT_CONFLICT
 
-        overlaps = [p for p in template.files if current and p in current.files]
-        _describe(template, template.review_digest())
-        if overlaps:
-            _out("  These would replace files you already have:")
-            for path in sorted(overlaps):
-                _out(f"    {path}")
-            _out("")
-        if not _confirm("Adopt this template into "
-                        f"{layout.agent_id}?"):
-            _out("\n  Nothing was adopted.\n")
-            return EXIT_OK
+    overlaps = [p for p in template.files if p in base.files]
+    _describe(template, template.review_digest())
+    if overlaps:
+        _out("  These would replace files you already have:")
+        for path in sorted(overlaps):
+            _out(f"    {path}")
+        _out("")
+    if not _confirm(f"Adopt this template into {layout.agent_id}?"):
+        _out("\n  Nothing was adopted.\n")
+        return EXIT_OK
 
-        installed = _copy_template(layout, journal, remote, template)
-        _out(f"\n  Copied {len(installed)} file(s) into {layout.agent_id}.")
-        return _checkpoint_after_template(
-            layout, journal, agent, current,
-            TemplateOrigin(url=remote.uri, snapshot_id=template.snapshot_id,
-                           sha256=head.sha256, adopted_at=utcnow(),
-                           managed_paths={p: r.sha256
-                                          for p, r in template.files.items()}))
-    finally:
-        journal.close()
+    installed, portable = _copy_template(layout, supervisor.journal, remote, template)
+    _out(f"\n  Copied {len(installed)} file(s) into {layout.agent_id}.")
+    return _checkpoint_after_template(
+        supervisor, portable,
+        TemplateOrigin(url=remote.uri, snapshot_id=template.snapshot_id,
+                       sha256=head.sha256, adopted_at=utcnow(),
+                       managed_paths={p: r.sha256 for p, r in template.files.items()}))
 
 
-def cmd_update(layout: Layout, *, network: str) -> int:
+def cmd_update(supervisor: "Supervisor") -> int:
     """Compare three versions of each adopted path and apply none on conflict."""
-    grant = read_env_file(layout.credentials_file).get(GRANT_ENV, "")
-    if not grant:
+    layout = supervisor.layout
+    if not read_env_file(layout.credentials_file).get(GRANT_ENV, ""):
         _out(f"\n  Not authorized; run 'hermes-pubky agent login "
              f"{layout.agent_id}'.\n")
         return EXIT_AUTH
 
-    layout.ensure()
-    journal = Journal(layout.journal_file)
-    try:
-        agent = AgentRemote.connect(grant, layout.owner, layout.agent_id)
-        current = _current_snapshot(journal, layout, agent)
-        if current is None or current.template is None:
-            _out("\n  This agent did not adopt a template.\n")
-            return EXIT_USAGE
+    base = _settled_base(supervisor)
+    if base is None:
+        return EXIT_CONFLICT
+    if base.template is None:
+        _out("\n  This agent did not adopt a template.\n")
+        return EXIT_USAGE
 
-        origin = current.template
-        remote = PublicTemplateRemote.from_uri(origin.url)
-        head = remote.read_head()
-        if head is None:
-            _out(f"\n  {origin.url} is no longer published. Your copies are "
-                 "unaffected.\n")
-            return EXIT_OK
-        upstream = remote.read_snapshot(
-            SnapshotRef(snapshot_id=head.snapshot_id, sha256=head.sha256))
-        if upstream.snapshot_id == origin.snapshot_id:
-            _out("\n  Already up to date.\n")
-            return EXIT_OK
+    origin = base.template
+    remote = PublicTemplateRemote.from_uri(origin.url)
+    head = remote.read_head()
+    if head is None:
+        _out(f"\n  {origin.url} is no longer published. Your copies are "
+             "unaffected.\n")
+        return EXIT_OK
+    upstream = remote.read_snapshot(
+        SnapshotRef(snapshot_id=head.snapshot_id, sha256=head.sha256))
+    if upstream.snapshot_id == origin.snapshot_id:
+        _out("\n  Already up to date.\n")
+        return EXIT_OK
 
-        proposed, conflicts, unchanged = _three_way(origin, current, upstream)
-        _out(f"\n  Update from {origin.snapshot_id[:8]} to "
-             f"{upstream.snapshot_id[:8]}\n" + "  " + "-" * 48)
-        for path in sorted(proposed):
-            _out(f"    update    {path}")
-        for path in sorted(unchanged):
-            _out(f"    unchanged {path}")
-        for path, reason in sorted(conflicts.items()):
-            _out(f"    CONFLICT  {path}  ({reason})")
+    plan = _three_way(origin, base, upstream)
+    _out(f"\n  Update from {origin.snapshot_id[:8]} to "
+         f"{upstream.snapshot_id[:8]}\n" + "  " + "-" * 48)
+    for path in sorted(plan.updates):
+        _out(f"    update    {path}")
+    for path in sorted(plan.deletions):
+        _out(f"    delete    {path}")
+    for path in sorted(plan.unchanged):
+        _out(f"    unchanged {path}")
+    for path, reason in sorted(plan.conflicts.items()):
+        _out(f"    CONFLICT  {path}  ({reason})")
 
-        if conflicts:
-            _out("\n  You changed these locally and upstream changed them too. "
-                 "No part of the update was applied; resolve them by hand, or "
-                 "keep your versions and re-run.\n")
-            return EXIT_CONFLICT
-        if not proposed:
-            _out("\n  Nothing to apply.\n")
-            return EXIT_OK
-        if not _confirm("Apply this update?"):
-            _out("\n  Nothing was applied.\n")
-            return EXIT_OK
+    if plan.conflicts:
+        _out("\n  You changed these locally and upstream changed them too. "
+             "No part of the update was applied; resolve them by hand, or "
+             "keep your versions and re-run.\n")
+        return EXIT_CONFLICT
+    if not plan.updates and not plan.deletions:
+        _out("\n  Nothing to apply.\n")
+        return EXIT_OK
+    if not _confirm("Apply this update?"):
+        _out("\n  Nothing was applied.\n")
+        return EXIT_OK
 
-        _copy_template(layout, journal, remote, upstream,
-                       only=set(proposed))
-        return _checkpoint_after_template(
-            layout, journal, agent, current,
-            TemplateOrigin(url=origin.url, snapshot_id=upstream.snapshot_id,
-                           sha256=head.sha256, adopted_at=utcnow(),
-                           managed_paths={p: r.sha256
-                                          for p, r in upstream.files.items()}))
-    finally:
-        journal.close()
+    _installed, portable = _copy_template(layout, supervisor.journal, remote,
+                                          upstream, only=set(plan.updates))
+    for path in plan.deletions:
+        destination = _template_destination(layout, path)
+        if destination is not None:
+            destination.unlink(missing_ok=True)
+        supervisor.journal.mark_deleted(path)
+    return _checkpoint_after_template(
+        supervisor, portable,
+        TemplateOrigin(url=origin.url, snapshot_id=upstream.snapshot_id,
+                       sha256=head.sha256, adopted_at=utcnow(),
+                       managed_paths={p: r.sha256 for p, r in upstream.files.items()}))
 
 
-def _three_way(origin: TemplateOrigin, current, upstream
-               ) -> Tuple[List[str], Dict[str, str], List[str]]:
-    """Compare last-adopted, personal and upstream hashes for each path."""
-    proposed: List[str] = []
-    conflicts: Dict[str, str] = {}
-    unchanged: List[str] = []
+def _settled_base(supervisor: "Supervisor"):
+    """The local base, once local changes are sealed and the remote agrees.
 
+    Template changes are ordinary checkpoints on top of the local state, so
+    that state has to be complete and publishable before one is applied.
+    """
+    supervisor.seal()
+    base = supervisor._base()  # noqa: SLF001 - same package
+    if base is None:
+        _out("\n  This agent has no saved state yet; run it once first.\n")
+        return None
+    remote_head = supervisor._connect().read_head()  # noqa: SLF001
+    pending = supervisor.journal.active_checkpoints()
+    expected = ((pending[0].parent_snapshot_id, pending[0].parent_hash) if pending
+                else (base.snapshot_id, hash_bytes(base.to_bytes())))
+    if remote_head is None or (remote_head.snapshot_id, remote_head.sha256) != expected:
+        _out("\n  The homeserver has a newer checkpoint than this machine; run "
+             f"'hermes-pubky agent sync {supervisor.layout.agent_id}' first.\n")
+        return None
+    return base
+
+
+@dataclass
+class UpdatePlan:
+    updates: List[str] = field(default_factory=list)
+    deletions: List[str] = field(default_factory=list)
+    unchanged: List[str] = field(default_factory=list)
+    conflicts: Dict[str, str] = field(default_factory=dict)
+
+
+def _three_way(origin: TemplateOrigin, current, upstream) -> UpdatePlan:
+    """Compare last-adopted, personal and upstream hashes for each path.
+
+    A path is only ever replaced when the personal copy is exactly what was
+    adopted. A new upstream file never lands on top of a personal file, and an
+    upstream deletion is applied only to an untouched copy.
+    """
+    plan = UpdatePlan()
     for path, record in upstream.files.items():
         adopted = origin.managed_paths.get(path)
         personal = current.files.get(path)
         personal_hash = personal.sha256 if personal else None
 
         if adopted is None:
-            proposed.append(path)  # new upstream file
+            if personal is None:
+                plan.updates.append(path)  # new upstream file
+            else:
+                plan.conflicts[path] = "new upstream file would replace your file"
         elif record.sha256 == adopted:
-            unchanged.append(path)
+            plan.unchanged.append(path)
         elif personal_hash == adopted:
-            proposed.append(path)  # your copy is untouched
+            plan.updates.append(path)  # your copy is untouched
         else:
-            conflicts[path] = "changed locally and upstream"
+            plan.conflicts[path] = "changed locally and upstream"
 
     for path, adopted in origin.managed_paths.items():
         if path in upstream.files:
             continue
         personal = current.files.get(path)
-        if personal is not None and personal.sha256 != adopted:
-            conflicts[path] = "deleted upstream, changed locally"
-    return proposed, conflicts, unchanged
+        if personal is None:
+            continue
+        if personal.sha256 == adopted:
+            plan.deletions.append(path)
+        else:
+            plan.conflicts[path] = "deleted upstream, changed locally"
+    return plan
 
 
 def _copy_template(layout: Layout, journal: Journal,
                    remote: PublicTemplateRemote, template: TemplateSnapshot,
-                   only: Optional[set] = None) -> List[str]:
-    """Fetch verified template bytes into the agent's own working copy."""
+                   only: Optional[set] = None
+                   ) -> Tuple[List[str], Optional[PortableConfig]]:
+    """Fetch verified template bytes into the agent's own working copy.
+
+    Everything is assembled in staging first; the working copy changes only
+    once every download has been verified, so a failure partway leaves it
+    untouched. Portable settings are returned, not written as a file: they
+    belong in the checkpoint's own `config/portable.json`.
+    """
     cache = ObjectCache(layout.cached_objects)
     pieces = {piece.object: piece
               for record in template.files.values() for piece in record.pieces}
@@ -454,18 +502,37 @@ def _copy_template(layout: Layout, journal: Journal,
         remote.read_object_to_path(pieces[reference], cached)
         return cached
 
-    installed: List[str] = []
-    for logical, record in sorted(template.files.items()):
-        if only is not None and logical not in only:
-            continue
-        destination = _template_destination(layout, logical)
-        if destination is None:
-            continue
-        assemble(record, resolve, destination)
-        journal.mark_dirty(logical)
-        installed.append(logical)
-    journal.bump_generation()
-    return installed
+    staging = layout.staging / "template"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    planned: List[Tuple[str, Path, Path]] = []
+    portable: Optional[PortableConfig] = None
+    try:
+        for logical, record in sorted(template.files.items()):
+            if only is not None and logical not in only:
+                continue
+            staged = staging / logical
+            assemble(record, resolve, staged)
+            if logical == PORTABLE_CONFIG_PATH:
+                portable = PortableConfig.parse(staged.read_bytes())
+                continue
+            destination = _template_destination(layout, logical)
+            if destination is not None:
+                planned.append((logical, staged, destination))
+
+        installed: List[str] = []
+        with journal.transaction():
+            for logical, staged, destination in planned:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(staged, destination)
+                journal.mark_dirty(logical)
+                installed.append(logical)
+            journal.bump_generation()
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    if portable is not None:
+        installed.append(PORTABLE_CONFIG_PATH)
+    return installed, portable
 
 
 def _template_destination(layout: Layout, logical: str) -> Optional[Path]:
@@ -473,37 +540,27 @@ def _template_destination(layout: Layout, logical: str) -> Optional[Path]:
         return layout.soul_file
     if logical == "workspace/AGENTS.md":
         return layout.agents_md
-    if logical == PORTABLE_CONFIG_PATH:
-        return layout.hermes_home / "portable-from-template.json"
     if logical.startswith("profile/skills/"):
         return layout.skills_dir / logical[len("profile/skills/"):]
     return None
 
 
-def _current_snapshot(journal: Journal, layout: Layout, agent: AgentRemote):
-    head = agent.read_head()
-    if head is None:
-        return None
-    return agent.read_snapshot(
-        SnapshotRef(snapshot_id=head.snapshot_id, sha256=head.sha256))
-
-
-def _checkpoint_after_template(layout: Layout, journal: Journal,
-                               agent: AgentRemote, base, origin: TemplateOrigin
-                               ) -> int:
+def _checkpoint_after_template(supervisor: "Supervisor",
+                               portable: Optional[PortableConfig],
+                               origin: TemplateOrigin) -> int:
     """Publish one private checkpoint recording the adopted content."""
-    from .sync import SyncEngine
-
-    cache = ObjectCache(layout.cached_objects)
-    projection = Projection(layout, journal, cache,
-                            runtime=adapter.runtime_info(),
-                            device_id=DeviceIdentity.load_or_create(
-                                layout.root).device_id)
-    candidate = projection.capture(base, template=origin)
+    journal = supervisor.journal
+    projection = supervisor._projection()  # noqa: SLF001 - same package
+    base = projection.base()
+    effective = portable if portable is not None else supervisor._current_portable()  # noqa: SLF001
+    candidate = projection.capture(base, template=origin, portable=effective)
     if isinstance(candidate, NoChange):
         _out("  Nothing changed.\n")
         return EXIT_OK
-    engine = SyncEngine(journal, agent, cache, recovery_dir=layout.recovery)
-    result = engine.sync_with_retries()
+    # The next run renders its configuration from the base; keep the generated
+    # file in step so the following capture does not read stale settings back.
+    supervisor._render_runtime(effective or PortableConfig())  # noqa: SLF001
+    result = supervisor._engine().sync_with_retries()  # noqa: SLF001
     _out(f"  {result.status}: {result.detail}\n")
+    del journal
     return EXIT_OK if result.ok else EXIT_INTEGRITY

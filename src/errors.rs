@@ -110,6 +110,8 @@ pub fn map_sdk_error(err: &pubky::Error) -> NativeError {
                 401 | 403 => NativeError::Auth(msg),
                 404 | 410 => NativeError::NotFound(msg),
                 413 => NativeError::TooLarge(msg),
+                // Throttling is transient: the caller backs off and retries.
+                429 => NativeError::Network(msg),
                 400 | 405..=412 | 414..=499 => NativeError::Validation(msg),
                 _ => NativeError::Network(msg),
             }

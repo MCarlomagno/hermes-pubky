@@ -1,8 +1,13 @@
 """What belongs in a checkpoint, and how a snapshot becomes a working copy.
 
 Capture scans an allowlist of sources, never a recursive walk of the management
-root. Materialization installs a validated generation beside the live one and
-swaps it, so a failed restore leaves the previous working copy intact.
+root. Materialization assembles and verifies a whole generation in staging
+before a single file is swapped in, so a failed restore leaves the previous
+working copy intact and the journal still describing it.
+
+The journal's `base` is the snapshot the working copy corresponds to. Sealing a
+checkpoint advances it, so consecutive captures chain, and installing a snapshot
+advances it, so the next capture builds on what was installed.
 
 Reference: implementation plan sections 6.2, 8.4 and 11.
 """
@@ -15,7 +20,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple
 
-from .journal import Journal, MaterializedFile, Upload, new_id, utcnow
+from .database import CapturedDatabase
+from .journal import (
+    BASE_DB_DIGEST,
+    BASE_DB_STAT,
+    BASE_SNAPSHOT,
+    Journal,
+    MaterializedFile,
+    Upload,
+    new_id,
+    utcnow,
+)
 from .models import (
     DATABASE_PATH,
     PORTABLE_CONFIG_PATH,
@@ -28,7 +43,7 @@ from .models import (
     TemplateOrigin,
     normalize_new_path,
 )
-from .objects import ObjectCache, StagedFile, assemble, hash_bytes, stage_file
+from .objects import ObjectCache, StagedFile, assemble, hash_bytes, hash_file, stage_file
 from .paths import Layout, executable_bit, write_private
 
 # Logical prefixes and their local homes.
@@ -104,8 +119,6 @@ class Ignore:
         path = workspace / IGNORE_FILE
         try:
             return Ignore.parse(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return Ignore()
         except OSError:
             return Ignore()
 
@@ -166,7 +179,8 @@ class Candidate:
 
     @property
     def object_count(self) -> int:
-        return len(self.uploads)
+        """Objects this checkpoint has to upload."""
+        return sum(1 for u in self.uploads if not u.acknowledged)
 
 
 class NoChange:
@@ -249,6 +263,41 @@ class Projection:
         self.runtime = runtime
         self.device_id = device_id
 
+    # -- the base -------------------------------------------------------------
+
+    def base(self) -> Optional[Snapshot]:
+        """The snapshot the working copy corresponds to, if any."""
+        snapshot_id = self.journal.get_setting(BASE_SNAPSHOT)
+        if not isinstance(snapshot_id, str):
+            return None
+        raw = self.layout.cached_snapshot(snapshot_id)
+        if not raw.is_file():
+            return None
+        try:
+            return Snapshot.parse(raw.read_bytes())
+        except SchemaError:
+            return None
+
+    def set_base(self, snapshot: Snapshot, *, db_digest: Optional[str]) -> None:
+        """Record that the working copy now corresponds to `snapshot`."""
+        write_private(self.layout.cached_snapshot(snapshot.snapshot_id),
+                      snapshot.to_bytes())
+        with self.journal.transaction():
+            self.journal.set_setting(BASE_SNAPSHOT, snapshot.snapshot_id)
+            self.journal.set_setting(BASE_DB_DIGEST, db_digest)
+            self.journal.set_setting(BASE_DB_STAT, self._db_stat())
+
+    def _db_stat(self) -> Optional[List[int]]:
+        try:
+            stat = self.layout.state_db.stat()
+        except OSError:
+            return None
+        return [stat.st_size, stat.st_mtime_ns]
+
+    def database_unchanged_by_stat(self) -> bool:
+        """Cheap pre-check: the database file has not been touched since base."""
+        return self._db_stat() == self.journal.get_setting(BASE_DB_STAT)
+
     # -- capture ------------------------------------------------------------
 
     def capture(
@@ -258,14 +307,16 @@ class Projection:
         name: str = "",
         last_session_id: Optional[str] = None,
         template: Optional[TemplateOrigin] = None,
-        database: Optional[Tuple[FileRecord, Dict[str, Path]]] = None,
+        database: Optional[CapturedDatabase] = None,
         portable: Optional[PortableConfig] = None,
     ):
         """Seal the current working copy as a candidate, or report no change.
 
-        Unchanged and remote-only files keep the descriptors the base snapshot
-        already had, so the absence of a never-fetched file is never read as a
-        deletion.
+        `base` should be `self.base()`: the sealed candidate becomes the new
+        base, so consecutive captures form a chain rather than siblings.
+
+        Unchanged and never-fetched files keep the descriptors the base already
+        had. A file that was materialized here and is now gone is a deletion.
         """
         generation_before = self.journal.generation
         staging = self.layout.staging / new_id()
@@ -274,21 +325,20 @@ class Projection:
         records: Dict[str, FileRecord] = {}
         staged_objects: Dict[str, Path] = {}
         inventory = self._local_inventory()
-        tombstones = {
-            record.logical_path for record in self.journal.list_materialized()
-            if record.explicit_delete
-        }
+        known = {r.logical_path: r for r in self.journal.list_materialized()}
+        tombstones = {p for p, r in known.items() if r.explicit_delete}
 
-        # 1. Carry forward everything the base described that we did not touch.
+        # 1. Carry forward what the base described and we did not touch.
         if base is not None:
             local_paths = {item.logical_path for item in inventory}
             for logical, record in base.files.items():
-                if logical in tombstones:
-                    continue
-                if logical in local_paths:
+                if logical in tombstones or logical in local_paths:
                     continue
                 if logical in (DATABASE_PATH, PORTABLE_CONFIG_PATH):
                     continue
+                previous = known.get(logical)
+                if previous is not None and previous.present:
+                    continue  # was here, now gone: an ordinary deletion
                 records[logical] = record
 
         # 2. Stage the local files.
@@ -304,18 +354,23 @@ class Projection:
 
         # 3. Generated documents supplied by the caller.
         if portable is not None:
-            body = portable.to_bytes()
             record, objects = self._stage_bytes(
-                PORTABLE_CONFIG_PATH, body, staging)
+                PORTABLE_CONFIG_PATH, portable.to_bytes(), staging)
             records[PORTABLE_CONFIG_PATH] = record
             staged_objects.update(objects)
         elif base is not None and PORTABLE_CONFIG_PATH in base.files:
             records[PORTABLE_CONFIG_PATH] = base.files[PORTABLE_CONFIG_PATH]
 
+        db_digest = self.journal.get_setting(BASE_DB_DIGEST)
         if database is not None:
-            record, objects = database
-            records[DATABASE_PATH] = record
-            staged_objects.update(objects)
+            if (base is not None and DATABASE_PATH in base.files
+                    and database.digest == db_digest):
+                # SQLite rewrote pages but no conversation row changed.
+                records[DATABASE_PATH] = base.files[DATABASE_PATH]
+            else:
+                records[DATABASE_PATH] = database.record
+                staged_objects.update(database.objects)
+            db_digest = database.digest
         elif base is not None and DATABASE_PATH in base.files:
             records[DATABASE_PATH] = base.files[DATABASE_PATH]
 
@@ -324,6 +379,7 @@ class Projection:
                 and base.template == template \
                 and (last_session_id or None) == (base.last_session_id or None):
             shutil.rmtree(staging, ignore_errors=True)
+            self.journal.set_setting(BASE_DB_STAT, self._db_stat())
             return NoChange()
 
         # 5. A turn that landed mid-capture invalidates the observation.
@@ -344,7 +400,7 @@ class Projection:
             last_session_id=last_session_id,
             template=template if template is not None else (base.template if base else None),
         )
-        return self._seal(snapshot, staged_objects, staging)
+        return self._seal(snapshot, staged_objects, staging, base, db_digest)
 
     def _local_inventory(self) -> List[Inventory]:
         items = core_inventory(self.layout)
@@ -368,20 +424,17 @@ class Projection:
                 return None
             if not item.source.is_file() or item.source.is_symlink():
                 return None
-            try:
-                staged = stage_file(item.source, item.logical_path, staging)
-            except (OSError, SchemaError):
-                raise
+            staged = stage_file(item.source, item.logical_path, staging)
             try:
                 after = item.source.stat()
             except OSError:
                 return None
             if (before.st_size, before.st_mtime_ns) == (after.st_size, after.st_mtime_ns):
                 # Reuse the previous descriptor when the content is identical,
-                # so an unchanged file uploads nothing.
+                # so an unchanged file uploads nothing. The staged objects are
+                # left alone: another file in this capture may share them, and
+                # the staging directory is removed whole at the end.
                 if existing is not None and existing.sha256 == staged.record.sha256:
-                    for path in staged.objects.values():
-                        path.unlink(missing_ok=True)
                     return StagedFile(logical_path=item.logical_path,
                                       record=existing, objects={})
                 return staged
@@ -396,23 +449,40 @@ class Projection:
         return staged.record, staged.objects
 
     def _seal(self, snapshot: Snapshot, staged_objects: Dict[str, Path],
-              staging: Path) -> Candidate:
-        """Commit the candidate's bytes to `pending/` before journaling it."""
+              staging: Path, base: Optional[Snapshot],
+              db_digest: Optional[str]) -> Candidate:
+        """Commit the candidate's bytes to `pending/`, then journal it whole.
+
+        Every object the snapshot references gets an upload row: new objects
+        unacknowledged with their pending copy, carried-forward ones already
+        acknowledged, because the base that referenced them was itself
+        published (or is queued ahead of this one). The checkpoint, its upload
+        rows, the inventory and the base advance in one transaction, so a crash
+        can never leave a publishable checkpoint that names objects the journal
+        does not know about.
+        """
         checkpoint_id = new_id()
         pending = self.layout.pending_checkpoint(checkpoint_id)
         (pending / "objects").mkdir(parents=True, exist_ok=True)
+        base_objects = set(base.objects()) if base is not None else set()
 
         uploads: List[Upload] = []
-        needed = snapshot.objects()
-        for reference, size in sorted(needed.items()):
+        for reference, size in sorted(snapshot.objects().items()):
             digest = reference.split("/", 1)[1].split(".", 1)[0]
             source = staged_objects.get(reference)
+            if source is None and reference in base_objects:
+                uploads.append(Upload(
+                    checkpoint_id=checkpoint_id, object_path=reference,
+                    sha256=digest, size=size,
+                    local_path=str(self.cache.path_for(reference)),
+                    acknowledged=True))
+                continue
             if source is None:
-                # Carried forward from the base; the cache holds it already.
-                cached = self.cache.path_for(reference)
-                if not cached.is_file():
-                    continue
-                source = cached
+                source = self.cache.path_for(reference)
+                if not source.is_file():
+                    raise SchemaError(
+                        f"{reference} is referenced by the capture but no local "
+                        "copy exists; the checkpoint was not sealed")
             target = pending / "objects" / Path(reference).name
             if not target.exists():
                 shutil.copy2(source, target)
@@ -428,33 +498,39 @@ class Projection:
         # fsync the directory so the references the journal records cannot
         # outlive the files they name.
         _fsync_dir(pending)
+        write_private(self.layout.cached_snapshot(snapshot.snapshot_id), body)
 
-        checkpoint = self.journal.create_checkpoint(
-            snapshot_path=str(snapshot_path), snapshot_hash=hash_bytes(body),
-            parent_snapshot_id=snapshot.parent.snapshot_id if snapshot.parent else None,
-            parent_hash=snapshot.parent.sha256 if snapshot.parent else None,
-            checkpoint_id=checkpoint_id)
-        self.journal.record_uploads(checkpoint.id, uploads)
-        self.journal.clear_dirty()
-        # Record the state this capture observed, so the next scan can tell an
-        # edit from an untouched file and a deletion from a never-fetched one.
-        for logical, record in snapshot.files.items():
-            existing = self.journal.get_materialized(logical)
-            try:
-                present = self.local_path(logical).is_file()
-            except SchemaError:
-                present = False
-            self.journal.set_materialized(MaterializedFile(
-                logical_path=logical, base_hash=record.sha256,
-                present=present if existing is None else (existing.present or present),
-                dirty=False, explicit_delete=False))
-        shutil.rmtree(staging, ignore_errors=True)
+        with self.journal.transaction():
+            checkpoint = self.journal.create_checkpoint(
+                snapshot_path=str(snapshot_path), snapshot_hash=hash_bytes(body),
+                parent_snapshot_id=snapshot.parent.snapshot_id if snapshot.parent else None,
+                parent_hash=snapshot.parent.sha256 if snapshot.parent else None,
+                checkpoint_id=checkpoint_id)
+            self.journal.record_uploads(checkpoint.id, uploads)
+            self.journal.clear_dirty()
+            # The inventory now describes this snapshot: what is present, and
+            # what is described but only held remotely.
+            for record in self.journal.list_materialized():
+                if record.logical_path not in snapshot.files:
+                    self.journal.forget_materialized(record.logical_path)
+            for logical, record in snapshot.files.items():
+                try:
+                    present = self.local_path(logical).is_file()
+                except SchemaError:
+                    present = False
+                self.journal.set_materialized(MaterializedFile(
+                    logical_path=logical, base_hash=record.sha256,
+                    present=present, dirty=False, explicit_delete=False))
+            self.journal.set_setting(BASE_SNAPSHOT, snapshot.snapshot_id)
+            self.journal.set_setting(BASE_DB_DIGEST, db_digest)
+            self.journal.set_setting(BASE_DB_STAT, self._db_stat())
 
-        # Objects belong in the cache too, so a later checkpoint reuses them.
-        for reference in needed:
-            source = staged_objects.get(reference)
-            if source is not None and source.exists():
+        # New objects belong in the cache too, so a later restore or capture
+        # reuses them. Adopt from staging before it is removed.
+        for reference, source in staged_objects.items():
+            if source.exists():
                 self.cache.adopt(reference, source)
+        shutil.rmtree(staging, ignore_errors=True)
 
         return Candidate(checkpoint_id=checkpoint.id, snapshot=snapshot,
                          snapshot_path=snapshot_path,
@@ -473,41 +549,54 @@ class Projection:
 
         Workspace documents stay remote-only until fetched. A file that was
         previously materialized and whose remote descriptor changed is
-        refreshed, so Hermes never reads stale bytes.
+        refreshed, so Hermes never reads stale bytes. Every file is assembled
+        and verified in staging first; only then are they swapped in, together
+        with the inventory that describes them.
         """
         wanted = self._paths_to_install(snapshot, extra_paths)
-        installed: List[str] = []
-        for logical in wanted:
-            record = snapshot.files[logical]
-            destination = self.local_path(logical)
-            existing = self.journal.get_materialized(logical)
-            if existing is not None and existing.dirty:
-                # Never overwrite work the user has not checkpointed.
-                continue
-            if (existing is not None and existing.present
-                    and existing.base_hash == record.sha256
-                    and destination.is_file()):
-                continue
-            if record.size == 0:
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(b"")
-                os.chmod(destination, 0o700 if record.executable else 0o600)
-            else:
-                assemble(record, resolve, destination)
-            self.journal.set_materialized(MaterializedFile(
-                logical_path=logical, base_hash=record.sha256, present=True,
-                dirty=False, explicit_delete=False))
-            installed.append(logical)
+        generation = self.layout.staging / f"generation-{new_id()[:8]}"
+        plan: List[Tuple[str, FileRecord, Path, Path]] = []
+        try:
+            for logical in wanted:
+                record = snapshot.files[logical]
+                destination = self.local_path(logical)
+                existing = self.journal.get_materialized(logical)
+                if existing is not None and existing.dirty:
+                    # Never overwrite work the user has not checkpointed.
+                    continue
+                if (existing is not None and existing.present
+                        and existing.base_hash == record.sha256
+                        and destination.is_file()):
+                    continue
+                staged = generation / logical
+                staged.parent.mkdir(parents=True, exist_ok=True)
+                if record.size == 0:
+                    staged.write_bytes(b"")
+                    os.chmod(staged, 0o700 if record.executable else 0o600)
+                else:
+                    assemble(record, resolve, staged)
+                plan.append((logical, record, destination, staged))
 
-        # Record remote-only files so their absence is never read as deletion.
-        for logical, record in snapshot.files.items():
-            if self.journal.get_materialized(logical) is None:
-                self.journal.set_materialized(MaterializedFile(
-                    logical_path=logical, base_hash=record.sha256, present=False,
-                    dirty=False, explicit_delete=False))
-
-        self._remove_vanished(snapshot)
-        return installed
+            installed: List[str] = []
+            with self.journal.transaction():
+                for logical, record, destination, staged in plan:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(staged, destination)
+                    self.journal.set_materialized(MaterializedFile(
+                        logical_path=logical, base_hash=record.sha256,
+                        present=True, dirty=False, explicit_delete=False))
+                    installed.append(logical)
+                # Remote-only files are recorded so their absence is never
+                # read as a deletion.
+                for logical, record in snapshot.files.items():
+                    if self.journal.get_materialized(logical) is None:
+                        self.journal.set_materialized(MaterializedFile(
+                            logical_path=logical, base_hash=record.sha256,
+                            present=False, dirty=False, explicit_delete=False))
+                self._remove_vanished(snapshot)
+            return installed
+        finally:
+            shutil.rmtree(generation, ignore_errors=True)
 
     def _paths_to_install(self, snapshot: Snapshot,
                           extra_paths: Iterable[str]) -> List[str]:
@@ -515,6 +604,12 @@ class Projection:
         for logical in snapshot.files:
             if logical in EAGER_PATHS or logical.startswith(SKILLS_PREFIX):
                 wanted.append(logical)
+        # Anything materialized earlier is refreshed too; a stale copy would be
+        # read by Hermes and republished over the newer remote bytes.
+        for record in self.journal.list_materialized():
+            if record.present and record.logical_path in snapshot.files \
+                    and record.logical_path not in wanted:
+                wanted.append(record.logical_path)
         for logical in extra_paths:
             if logical in snapshot.files and logical not in wanted:
                 wanted.append(logical)
@@ -524,15 +619,19 @@ class Projection:
     def _remove_vanished(self, snapshot: Snapshot) -> None:
         """Drop tracked local files the snapshot no longer contains.
 
-        Only proven-clean files are removed, and the previous generation is
-        preserved under `recovery/` first.
+        Only proven-clean files are removed, and the previous bytes are kept
+        under `recovery/` first.
         """
         for record in self.journal.list_materialized():
             if record.logical_path in snapshot.files:
                 continue
             if record.dirty or record.explicit_delete:
                 continue
-            local = self.local_path(record.logical_path)
+            try:
+                local = self.local_path(record.logical_path)
+            except SchemaError:
+                self.journal.forget_materialized(record.logical_path)
+                continue
             if record.present and local.is_file():
                 backup = (self.layout.recovery / f"{utcnow().replace(':', '')}-removed"
                           / record.logical_path)
@@ -560,15 +659,10 @@ class Projection:
         dirty: List[str] = []
         for item in self._local_inventory():
             record = self.journal.get_materialized(item.logical_path)
-            if record is None:
-                dirty.append(item.logical_path)
-                continue
-            if record.dirty:
+            if record is None or record.dirty:
                 dirty.append(item.logical_path)
                 continue
             try:
-                from .objects import hash_file
-
                 digest, _size = hash_file(item.source)
             except OSError:
                 continue
@@ -577,6 +671,8 @@ class Projection:
         # A tracked file that was deleted locally is a change too.
         for record in self.journal.list_materialized():
             if not record.present or record.explicit_delete:
+                continue
+            if record.logical_path in (DATABASE_PATH, PORTABLE_CONFIG_PATH):
                 continue
             try:
                 local = self.local_path(record.logical_path)

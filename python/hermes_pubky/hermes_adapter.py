@@ -312,31 +312,3 @@ def launch_command(
     if query:
         argv += ["--oneshot", query]
     return argv
-
-
-# -- conversation database ----------------------------------------------------
-#
-# Implemented in the conversation-recovery slice. Declared here so the
-# supervisor's import surface is stable, and so an early call fails loudly
-# instead of silently skipping saved conversations.
-
-class ConversationUnsupported(SchemaError):
-    """The conversation database could not be captured or restored."""
-
-
-def capture_database(layout: Layout, cache: Any):
-    """Consistent snapshot of `state.db`, chunked and hashed.
-
-    Returns `(FileRecord, {object_reference: staged_path})`, or None when there
-    is no database yet.
-    """
-    from .database import capture_database as _capture
-
-    return _capture(layout, cache)
-
-
-def restore_database(record: Any, resolve: Any, layout: Layout) -> None:
-    """Rebuild `state.db` from a snapshot's chunks, verified end to end."""
-    from .database import restore_database as _restore
-
-    return _restore(record, resolve, layout)

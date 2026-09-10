@@ -20,18 +20,9 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from . import hermes_adapter as adapter
-from .journal import Journal
 from .models import PortableConfig, SchemaError
-from .objects import ObjectCache
-from .paths import (
-    GRANT_ENV,
-    DeviceIdentity,
-    Layout,
-    layout_for,
-    write_env_file,
-    write_private,
-)
-from .projection import NoChange, Projection, scan_workspace
+from .paths import GRANT_ENV, Layout, layout_for, write_env_file, write_private
+from .projection import scan_workspace
 from .storage import AgentRemote, native
 from .supervisor import (
     EXIT_AUTH,
@@ -90,7 +81,7 @@ def create_agent(*, agent_id: str, network: str,
         return EXIT_INTEGRITY
 
     imported: Optional[ImportPlan] = None
-    if from_hermes_home is not None:
+    if from_hermes_home is not None or workspace is not None:
         try:
             imported = plan_import(from_hermes_home, workspace)
         except SchemaError as exc:
@@ -123,7 +114,8 @@ def create_agent(*, agent_id: str, network: str,
     from .cli import save_connection
 
     save_connection(layout, network)
-    return _publish_first(layout, remote, network)
+    return _publish_first(layout, remote, network,
+                          imported.portable if imported else PortableConfig())
 
 
 def _owner_of(secret: str) -> str:
@@ -149,42 +141,29 @@ def _seed_fresh(layout: Layout) -> None:
     open_or_create(layout)
 
 
-def _publish_first(layout: Layout, remote: AgentRemote, network: str) -> int:
-    """Capture the new working copy and publish it."""
-    from .sync import SyncEngine
+def _publish_first(layout: Layout, remote: AgentRemote, network: str,
+                   portable: PortableConfig) -> int:
+    """Capture the new working copy and publish it, under the connection lock."""
+    from .supervisor import Supervisor
 
-    journal = Journal(layout.journal_file)
-    try:
-        cache = ObjectCache(layout.cached_objects)
-        projection = Projection(layout, journal, cache,
-                                runtime=adapter.runtime_info(),
-                                device_id=DeviceIdentity.load_or_create(
-                                    layout.root).device_id)
-        portable = PortableConfig()
+    supervisor = Supervisor(layout, network=network, remote_factory=lambda: remote)
+    with supervisor.session():
+        # The generated configuration is where later runs read the portable
+        # settings back from, so an imported model or toolset must land in it.
         adapter.write_config(layout, adapter.render_config(portable, layout, {}))
-        from .database import capture_database
+        result = supervisor.sync()
+        base = supervisor._base()  # noqa: SLF001 - same package
+    if not result.ok:
+        _out(f"\n  Saved locally but not published: {result.detail}")
+        _out(f"  Retry with 'hermes-pubky agent sync {layout.agent_id}'.\n")
+        return EXIT_SAVED_LOCALLY
 
-        candidate = projection.capture(None, portable=portable,
-                                       database=capture_database(layout, cache))
-        if isinstance(candidate, NoChange):
-            _out("\n  Nothing to publish.\n")
-            return EXIT_OK
-
-        engine = SyncEngine(journal, remote, cache, recovery_dir=layout.recovery)
-        result = engine.sync_with_retries()
-        if not result.ok:
-            _out(f"\n  Saved locally but not published: {result.detail}")
-            _out(f"  Retry with 'hermes-pubky agent sync {layout.agent_id}'.\n")
-            return EXIT_SAVED_LOCALLY
-
-        _out(f"\n  Created {layout.agent_id}")
-        _out(f"    address    {remote.uri}")
-        _out(f"    workspace  {layout.workspace}")
-        _out(f"    files      {len(candidate.snapshot.files)}")
-        _out(f"\n  Run it with: hermes-pubky run {layout.agent_id}\n")
-        return EXIT_OK
-    finally:
-        journal.close()
+    _out(f"\n  Created {layout.agent_id}")
+    _out(f"    address    {remote.uri}")
+    _out(f"    workspace  {layout.workspace}")
+    _out(f"    files      {len(base.files) if base else 0}")
+    _out(f"\n  Run it with: hermes-pubky run {layout.agent_id}\n")
+    return EXIT_OK
 
 
 def attach_agent(*, uri: str, network: str) -> int:
@@ -231,23 +210,22 @@ def attach_agent(*, uri: str, network: str) -> int:
     write_env_file(layout.credentials_file, {GRANT_ENV: secret})
     save_connection(layout, network)
 
-    journal = Journal(layout.journal_file)
-    try:
-        # Dirty local state is preserved and reconciled, never reset.
-        projection = Projection(layout, journal, ObjectCache(layout.cached_objects),
-                                runtime=adapter.runtime_info(),
-                                device_id=DeviceIdentity.load_or_create(
-                                    layout.root).device_id)
-        dirty = projection.scan_dirty()
-        if dirty:
-            _out(f"\n  {len(dirty)} local file(s) have uncheckpointed changes; "
-                 "they were kept and will be reconciled on the next run.")
-        write_private(layout.cached_head, head.to_bytes())
-        write_private(layout.cached_snapshot(snapshot.snapshot_id),
-                      snapshot.to_bytes())
-        journal.set_setting("cached_snapshot_id", snapshot.snapshot_id)
-    finally:
-        journal.close()
+    from .supervisor import Supervisor
+
+    supervisor = Supervisor(layout, network=network, remote_factory=lambda: remote)
+    with supervisor.session():
+        # Anything already here is sealed against its own base first, so an
+        # attach over an existing working copy reconciles rather than resets.
+        supervisor.seal()
+        if supervisor.journal.has_pending():
+            _out("\n  This machine already has unsaved work for this agent; run "
+                 f"'hermes-pubky agent sync {agent_id}' to reconcile it.\n")
+            return EXIT_SAVED_LOCALLY
+        try:
+            supervisor.install(snapshot)
+        except Exception as exc:  # noqa: BLE001
+            _out(f"\n  Could not restore the working copy: {exc}\n")
+            return EXIT_INTEGRITY
 
     _out(f"\n  Attached {agent_id}")
     _out(f"    owner      {owner}")
@@ -265,7 +243,7 @@ def attach_agent(*, uri: str, network: str) -> int:
 class ImportPlan:
     """What an explicit import would copy, before anything is written."""
 
-    def __init__(self, source: Path, workspace: Optional[Path]) -> None:
+    def __init__(self, source: Optional[Path], workspace: Optional[Path]) -> None:
         self.source = source
         self.workspace = workspace
         self.files: List[Tuple[str, Path, int]] = []
@@ -274,13 +252,21 @@ class ImportPlan:
         self.portable: PortableConfig = PortableConfig()
 
 
-def plan_import(source: Path, workspace: Optional[Path]) -> ImportPlan:
-    """Inventory a pinned-layout Hermes profile. Reads only."""
+def plan_import(source: Optional[Path], workspace: Optional[Path]) -> ImportPlan:
+    """Inventory a pinned-layout Hermes profile and/or a workspace. Reads only."""
+    workspace = workspace.expanduser().resolve() if workspace else None
+    if workspace is not None and not workspace.is_dir():
+        raise SchemaError(f"{workspace} is not a directory")
+    if source is None:
+        plan = ImportPlan(None, workspace)
+        _plan_workspace(plan)
+        return plan
+
     source = source.expanduser().resolve()
     if not source.is_dir():
         raise SchemaError(f"{source} is not a directory")
 
-    plan = ImportPlan(source, workspace.expanduser().resolve() if workspace else None)
+    plan = ImportPlan(source, workspace)
 
     candidates = {
         "profile/SOUL.md": source / "SOUL.md",
@@ -327,12 +313,7 @@ def plan_import(source: Path, workspace: Optional[Path]) -> ImportPlan:
     if database.is_file():
         plan.database = database
 
-    if plan.workspace is not None:
-        included, excluded = scan_workspace(plan.workspace)
-        for item in included:
-            plan.files.append((item.logical_path, item.source,
-                               item.source.stat().st_size))
-        plan.excluded.extend(excluded)
+    _plan_workspace(plan)
 
     # Plugin state of any kind is ignored, including the 0.1 plugin's.
     if (source / "plugins").is_dir():
@@ -343,9 +324,19 @@ def plan_import(source: Path, workspace: Optional[Path]) -> ImportPlan:
     return plan
 
 
+def _plan_workspace(plan: ImportPlan) -> None:
+    if plan.workspace is None:
+        return
+    included, excluded = scan_workspace(plan.workspace)
+    for item in included:
+        plan.files.append((item.logical_path, item.source,
+                           item.source.stat().st_size))
+    plan.excluded.extend(excluded)
+
+
 def preview_import(plan: ImportPlan) -> bool:
     """Show what would be copied and ask. Cancellation imports nothing."""
-    _out(f"\n  Importing from {plan.source}\n" + "  " + "-" * 48)
+    _out(f"\n  Importing from {plan.source or plan.workspace}\n" + "  " + "-" * 48)
     total = 0
     for logical, _path, size in plan.files:
         _out(f"    {logical:<44} {size:>9}")
@@ -396,7 +387,10 @@ def apply_import(plan: ImportPlan, layout: Layout) -> None:
             write_private(path, b"")
 
     if plan.database is not None:
-        shutil.copy2(plan.database, layout.state_db)
+        # Through the backup API: a plain copy misses committed WAL frames.
+        from .database import copy_database
+
+        copy_database(plan.database, layout.state_db)
     else:
         from .database import open_or_create
 

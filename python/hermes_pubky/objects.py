@@ -117,11 +117,10 @@ def stage_file(
         for piece_digest, piece_size, staged in _split(handle, out_dir, extension):
             ref = object_ref(piece_digest, extension)
             pieces.append(Piece(object=ref, sha256=piece_digest, size=piece_size))
-            # The same content can repeat inside one file; keep one copy.
-            if ref in objects:
-                staged.unlink(missing_ok=True)
-            else:
-                objects[ref] = staged
+            # The same content can repeat inside one file. `_split` names the
+            # object by digest, so the repeat replaced the earlier file in
+            # place: record it once and never unlink it.
+            objects.setdefault(ref, staged)
 
     record = FileRecord(sha256=whole, size=size, executable=executable, pieces=pieces)
     # Re-validate through the parser so a staging bug cannot produce a manifest

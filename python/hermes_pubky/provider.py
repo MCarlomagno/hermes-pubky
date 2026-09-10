@@ -346,9 +346,12 @@ class PubkyMemoryProvider(MemoryProvider):
             return {"error": f"{relative} has local changes; fetching would "
                              "overwrite them"}
 
-        # A stable id makes the request idempotent across retries.
+        # Idempotent within one run for one version of the file: a repeated
+        # ask does not queue a second download, a later run or a newer remote
+        # copy gets a fresh request rather than a stale failure.
         request_id = hashlib.sha256(
-            f"{REQUEST_FILE_FETCH}:{logical}".encode("utf-8")).hexdigest()[:32]
+            f"{REQUEST_FILE_FETCH}:{logical}:{record.base_hash}:{self._run_id}"
+            .encode("utf-8")).hexdigest()[:32]
         request = self._journal.enqueue_request(
             REQUEST_FILE_FETCH, {"logicalPath": logical}, self._run_id,
             request_id=request_id)

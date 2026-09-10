@@ -21,6 +21,7 @@ from hermes_pubky.templates import (
 
 RUNTIME = m.RuntimeInfo("hermes", "0.19.0", "hermes-0.19-sqlite22-v1")
 STAMP = "2026-09-09T18:00:00Z"
+OWNER = "8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo"
 
 
 def make_bundle(tmp_path: Path, **files) -> Path:
@@ -151,65 +152,102 @@ def template_with(files: dict) -> m.TemplateSnapshot:
 
 
 class TestThreeWayUpdate:
-    def test_an_untouched_path_is_proposed(self):
-        adopted = {"profile/SOUL.md": "a" * 64}
-        current = snapshot_with({"profile/SOUL.md": "a" * 64})
-        upstream = template_with({"profile/SOUL.md": "b" * 64})
-        proposed, conflicts, unchanged = _three_way(origin(adopted), current, upstream)
-        assert proposed == ["profile/SOUL.md"] and not conflicts
+    """Only a copy that is exactly what was adopted is ever replaced."""
 
-    def test_an_unchanged_upstream_path_is_reported_unchanged(self):
-        adopted = {"profile/SOUL.md": "a" * 64}
-        current = snapshot_with({"profile/SOUL.md": "a" * 64})
-        upstream = template_with({"profile/SOUL.md": "a" * 64})
-        proposed, conflicts, unchanged = _three_way(origin(adopted), current, upstream)
-        assert unchanged == ["profile/SOUL.md"] and not proposed and not conflicts
+    A, B, C = "a" * 64, "b" * 64, "c" * 64
 
-    def test_a_locally_edited_path_that_also_changed_upstream_conflicts(self):
-        adopted = {"profile/SOUL.md": "a" * 64}
-        current = snapshot_with({"profile/SOUL.md": "c" * 64})  # personal edit
-        upstream = template_with({"profile/SOUL.md": "b" * 64})
-        proposed, conflicts, _unchanged = _three_way(origin(adopted), current, upstream)
-        assert list(conflicts) == ["profile/SOUL.md"]
-        assert not proposed
+    @pytest.mark.parametrize("adopted,personal,upstream,expected", [
+        # untouched locally, changed upstream: update
+        (A, A, B, ("updates", "profile/SOUL.md")),
+        # unchanged upstream: nothing to do, whatever happened locally
+        (A, A, A, ("unchanged", "profile/SOUL.md")),
+        (A, C, A, ("unchanged", "profile/SOUL.md")),
+        # changed on both sides: conflict
+        (A, C, B, ("conflicts", "profile/SOUL.md")),
+        # never adopted, absent locally: a new file is proposed
+        (None, None, B, ("updates", "profile/SOUL.md")),
+        # never adopted, but a personal file exists: never replaced
+        (None, C, B, ("conflicts", "profile/SOUL.md")),
+        # deleted upstream, untouched locally: deletion proposed
+        (A, A, None, ("deletions", "profile/SOUL.md")),
+        # deleted upstream, edited locally: conflict
+        (A, C, None, ("conflicts", "profile/SOUL.md")),
+    ])
+    def test_each_path_lands_in_exactly_one_bucket(self, adopted, personal,
+                                                     upstream, expected):
+        path = "profile/SOUL.md"
+        plan = _three_way(
+            origin({path: adopted} if adopted else {}),
+            snapshot_with({path: personal} if personal else {}),
+            template_with({path: upstream} if upstream else {}))
+        buckets = {"updates": plan.updates, "deletions": plan.deletions,
+                   "unchanged": plan.unchanged, "conflicts": list(plan.conflicts)}
+        assert {k: v for k, v in buckets.items() if v} == {expected[0]: [expected[1]]}
 
-    def test_a_locally_edited_path_that_did_not_change_upstream_is_left_alone(self):
-        adopted = {"profile/SOUL.md": "a" * 64}
-        current = snapshot_with({"profile/SOUL.md": "c" * 64})
-        upstream = template_with({"profile/SOUL.md": "a" * 64})
-        proposed, conflicts, unchanged = _three_way(origin(adopted), current, upstream)
-        assert unchanged == ["profile/SOUL.md"] and not conflicts
+    def test_a_conflict_anywhere_is_visible_beside_the_clean_paths(self):
+        # cmd_update applies nothing while conflicts remain; this asserts the
+        # data that decision is made from.
+        plan = _three_way(
+            origin({"a.md": self.A, "b.md": self.A}),
+            snapshot_with({"a.md": self.C, "b.md": self.A}),
+            template_with({"a.md": self.B, "b.md": self.B}))
+        assert list(plan.conflicts) == ["a.md"] and plan.updates == ["b.md"]
 
-    def test_a_new_upstream_file_is_proposed(self):
-        adopted = {"profile/SOUL.md": "a" * 64}
-        current = snapshot_with({"profile/SOUL.md": "a" * 64})
-        upstream = template_with({"profile/SOUL.md": "a" * 64,
-                                  "profile/skills/new/SKILL.md": "d" * 64})
-        proposed, conflicts, _unchanged = _three_way(origin(adopted), current, upstream)
-        assert proposed == ["profile/skills/new/SKILL.md"] and not conflicts
 
-    def test_a_path_deleted_upstream_but_edited_locally_conflicts(self):
-        adopted = {"profile/skills/old/SKILL.md": "a" * 64}
-        current = snapshot_with({"profile/skills/old/SKILL.md": "c" * 64})
-        upstream = template_with({})
-        _proposed, conflicts, _unchanged = _three_way(origin(adopted), current, upstream)
-        assert list(conflicts) == ["profile/skills/old/SKILL.md"]
+class TestAdoption:
+    def test_template_settings_are_adopted_into_the_checkpoint(self, tmp_path, monkeypatch):
+        """A template's portable.json becomes the agent's, not a stray file."""
+        from fakes import FakeAgentRemote
 
-    def test_a_path_deleted_upstream_and_untouched_locally_is_not_a_conflict(self):
-        adopted = {"profile/skills/old/SKILL.md": "a" * 64}
-        current = snapshot_with({"profile/skills/old/SKILL.md": "a" * 64})
-        upstream = template_with({})
-        _proposed, conflicts, _unchanged = _three_way(origin(adopted), current, upstream)
-        assert not conflicts
+        from hermes_pubky import hermes_adapter as adapter
+        from hermes_pubky.journal import new_id
+        from hermes_pubky.objects import ObjectCache, stage_file
+        from hermes_pubky.paths import Layout
+        from hermes_pubky.supervisor import Supervisor
+        from hermes_pubky.templates import _checkpoint_after_template, _copy_template
 
-    def test_a_conflict_anywhere_leaves_the_whole_update_unproposed(self):
-        # One conflict means none of the update is applied, so a caller must not
-        # be able to advance the pin partially.
-        adopted = {"a.md": "a" * 64, "b.md": "a" * 64}
-        current = snapshot_with({"a.md": "c" * 64, "b.md": "a" * 64})
-        upstream = template_with({"a.md": "b" * 64, "b.md": "b" * 64})
-        proposed, conflicts, _unchanged = _three_way(origin(adopted), current, upstream)
-        assert conflicts, "the edited path must conflict"
-        assert "b.md" in proposed, "the clean path is still proposed"
-        # cmd_update refuses to apply anything while conflicts remain; this
-        # asserts the data the decision is made from.
+        monkeypatch.setattr(adapter, "assert_supported_runtime", lambda: "0.19.0")
+        remote = FakeAgentRemote()
+        layout = Layout(root=tmp_path / "root", network="testnet", owner=OWNER,
+                        agent_id="default").ensure()
+        layout.soul_file.write_bytes(b"# mine\n")
+        supervisor = Supervisor(layout, network="testnet", remote_factory=lambda: remote)
+
+        # A published template whose objects the fake "homeserver" serves.
+        bundle = tmp_path / "bundle"
+        bundle.mkdir()
+        (bundle / "portable.json").write_bytes(
+            m.PortableConfig(model="template/model").to_bytes())
+        (bundle / "SOUL.md").write_bytes(b"# from the template\n")
+        files, template_objects = {}, {}
+        for name, logical in (("portable.json", m.PORTABLE_CONFIG_PATH),
+                              ("SOUL.md", "profile/SOUL.md")):
+            staged = stage_file(bundle / name, logical, tmp_path / "staged")
+            files[logical] = staged.record
+            for ref, path in staged.objects.items():
+                remote.objects[ref] = path.read_bytes()
+        template = m.TemplateSnapshot(template_id="researcher", snapshot_id=new_id(),
+                                      created_at=STAMP, runtime=RUNTIME, files=files)
+
+        with supervisor.session() as s:
+            adapter.write_config(layout, adapter.render_config(
+                m.PortableConfig(model="original/model"), layout, {}))
+            assert s.sync().ok
+            installed, portable = _copy_template(layout, s.journal, remote, template)
+            assert portable is not None and portable.model == "template/model"
+            assert layout.soul_file.read_bytes() == b"# from the template\n"
+            assert not (layout.hermes_home / "portable-from-template.json").exists()
+            code = _checkpoint_after_template(s, portable, m.TemplateOrigin(
+                url="pubky://k/pub/t/head.json", snapshot_id=template.snapshot_id,
+                sha256="a" * 64, adopted_at=STAMP,
+                managed_paths={p: r.sha256 for p, r in files.items()}))
+            assert code == 0
+            base = s._base()  # noqa: SLF001
+        head = remote.read_head()
+        assert head.snapshot_id == base.snapshot_id
+        assert base.template is not None
+        assert base.files[m.PORTABLE_CONFIG_PATH].sha256 == files[m.PORTABLE_CONFIG_PATH].sha256
+        # The rendered configuration follows, so the next capture agrees.
+        import yaml
+
+        assert yaml.safe_load(layout.hermes_config_file.read_text())["model"] == "template/model"

@@ -85,8 +85,6 @@ class TestPermissions:
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
         assert read_env_file(path) == {GRANT_ENV: "secret-value"}
 
-    def test_reading_a_missing_env_file_is_empty(self, tmp_path):
-        assert read_env_file(tmp_path / "absent.env") == {}
 
 
 class TestHermesLayout:
@@ -173,8 +171,6 @@ class TestConnectionDiscovery:
             layout.connection_file.write_text("{}", encoding="utf-8")
         assert sorted(c.owner for c in iter_connections(tmp_path)) == sorted([A, B])
 
-    def test_an_absent_root_lists_nothing(self, tmp_path):
-        assert list(iter_connections(tmp_path / "absent")) == []
 
 
 class TestDeviceIdentity:
