@@ -213,8 +213,14 @@ class Journal:
         except sqlite3.Error as exc:
             raise JournalError(f"could not open {self.path}: {exc}") from exc
         self._conn.row_factory = sqlite3.Row
-        self._configure()
-        self._migrate()
+        try:
+            self._configure()
+            self._migrate()
+        except BaseException:
+            # A journal that cannot be opened is reported, not leaked: the
+            # connection would otherwise stay open until garbage collection.
+            self._conn.close()
+            raise
         try:
             os.chmod(self.path, 0o600)
         except OSError:
