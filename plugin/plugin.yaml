@@ -1,0 +1,11 @@
+name: hermes-pubky
+version: "0.2.0"
+kind: standalone
+description: "Run a managed Hermes agent whose saved state lives on your Pubky homeserver."
+author: Marcos Carlomagno
+license: MIT
+homepage: https://github.com/MCarlomagno/hermes-pubky
+provides_tools: []
+provides_hooks: []
+provides_middleware: []
+requires_env: []

@@ -110,7 +110,7 @@ jobs:
           maturin build --release --out dist
           uv pip install --system dist/*.whl
       - name: Upstream contract and conversation fixtures
-        run: pytest tests/test_hermes_contract.py tests/test_database.py -q
+        run: pytest tests/test_hermes_contract.py tests/test_database.py tests/test_plugin_distribution.py -q
       - name: Launch a real managed Hermes turn
         run: python scripts/check_managed_hermes_integration.py
 

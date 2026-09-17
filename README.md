@@ -50,6 +50,32 @@ memories, skills, settings and conversation database; workspace documents are
 fetched when the agent asks for them. Every run saves a checkpoint when it ends,
 and the next run on any machine starts from the newest one.
 
+### Hermes plugin packaging
+
+`plugin/` is the directory-plugin wrapper for catalog distribution. It declares
+the pinned `hermes-pubky` package dependency, which includes the native Pubky
+extension, and adds `/pubky` setup help when enabled. Managed agents still
+start through `hermes-pubky run`; enabling the companion does not sync an
+ordinary Hermes profile or select its memory provider.
+
+Once this directory is published in the repository, install it with:
+
+```bash
+hermes plugins install MCarlomagno/hermes-pubky/plugin
+hermes plugins enable hermes-pubky
+```
+
+Hermes 0.19.0 only copies the plugin directory; it does not install its Python
+dependencies automatically. Use the pip installation above in that environment.
+Newer installers can read `plugin/pyproject.toml`, but the managed launcher
+still requires Hermes 0.19.0 exactly. Use a separate environment if needed.
+The installer also displays [setup instructions](plugin/after-install.md).
+
+For a catalog submission, set `subdir: plugin` and `requires_hermes: "==0.19.0"`.
+Keep the wrapper's manifest version, project version, and exact package
+dependency aligned with the published release. The wrapper never downloads or
+updates code at import time.
+
 ## Commands
 
 ```text
