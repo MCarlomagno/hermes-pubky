@@ -9,7 +9,7 @@ Newer Hermes installers read this plugin's pinned Python dependency. Hermes
 your activated Hermes 0.19.0 environment:
 
 ```sh
-uv pip install hermes-pubky==0.2.0
+uv pip install hermes-pubky==0.2.1
 ```
 
 The package includes the native Pubky extension. Release wheels support macOS

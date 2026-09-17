@@ -16,7 +16,7 @@ def _setup_help(raw_args: str) -> str:
         "  hermes-pubky run <agent-id>\n\n"
         "Hermes 0.19.0 does not install plugin dependencies automatically. "
         "If the launcher is missing, run:\n"
-        "  uv pip install hermes-pubky==0.2.0\n\n"
+        "  uv pip install hermes-pubky==0.2.1\n\n"
         "Enabling this companion does not sync the current Hermes profile. "
         "The launcher creates a dedicated profile and manages its saved state."
     )

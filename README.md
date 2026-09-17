@@ -28,7 +28,7 @@ anything else machine-specific.
 ## Install
 
 ```bash
-uv pip install hermes-pubky==0.2.0 "hermes-agent==0.19.0"
+uv pip install hermes-pubky==0.2.1 "hermes-agent==0.19.0"
 hermes-pubky agent init default
 hermes-pubky run default
 ```
@@ -40,7 +40,7 @@ publishes the agent's first checkpoint.
 On a second computer:
 
 ```bash
-uv pip install hermes-pubky==0.2.0 "hermes-agent==0.19.0"
+uv pip install hermes-pubky==0.2.1 "hermes-agent==0.19.0"
 hermes-pubky agent attach pubky://<owner>/priv/hermes.pubky.app/v2/agents/default/head.json
 hermes-pubky run default
 ```

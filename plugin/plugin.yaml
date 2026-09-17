@@ -1,5 +1,5 @@
 name: hermes-pubky
-version: "0.2.0"
+version: "0.2.1"
 kind: standalone
 description: "Run a managed Hermes agent whose saved state lives on your Pubky homeserver."
 author: Marcos Carlomagno
