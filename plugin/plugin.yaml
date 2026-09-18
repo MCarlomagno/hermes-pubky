@@ -1,7 +1,8 @@
 name: hermes-pubky
-version: "0.2.1"
+version: "0.2.2"
 kind: standalone
-description: "Run a managed Hermes agent whose saved state lives on your Pubky homeserver."
+description: "Setup helper for managed Pubky agents. The launcher syncs agent state, including conversation database snapshots and portable configuration, to your remote Pubky homeserver."
+requires_hermes: "==0.21.3"
 author: Marcos Carlomagno
 license: MIT
 homepage: https://github.com/MCarlomagno/hermes-pubky

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the pinned Hermes conversation-database fixture.
 
-Slice 0 of the 0.2 plan: capture what Hermes 0.19.0 actually writes, so the
+Capture what the verified Hermes runtime actually writes, so the
 adapter's normalization and restore logic can be tested against recorded
 values instead of assumptions.
 
@@ -9,7 +9,7 @@ Builds five scenarios in an isolated HERMES_HOME -- plain turns, a tool
 call/result pair, rewound (inactive) messages, a compaction lineage, and a
 workspace cwd -- then records the schema shape and the durable rows.
 
-    python scripts/generate_hermes_fixture.py --out tests/fixtures/hermes_0_19_0_schema22.json
+    python scripts/generate_hermes_fixture.py
 
 Refuses to run against the caller's real Hermes home.
 """
@@ -26,14 +26,15 @@ from pathlib import Path
 
 # Tables whose contents must survive a handoff, versus tables the adapter
 # clears because they describe one machine's live state.
-DURABLE_TABLES = ("sessions", "messages", "session_model_usage")
+DURABLE_TABLES = ("sessions", "messages", "session_model_usage", "system_prompts")
 RUNTIME_TABLES = (
-    "state_meta",
     "gateway_routing",
     "compression_locks",
     "async_delegations",
     "telegram_dm_topic_bindings",
     "telegram_dm_topic_mode",
+    "gateway_hygiene_state", "conversation_generations", "gateway_heartbeats",
+    "session_turn_leases",
 )
 
 
@@ -66,7 +67,8 @@ def build(db, workspace: Path) -> dict:
 
     # 1. A plain conversation.
     plain = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    db.create_session(plain, "cli", cwd=str(workspace))
+    db.create_session(plain, "cli", cwd=str(workspace),
+                      system_prompt="Synthetic system prompt for portability tests.")
     db.append_message(plain, "user", content="what is in the workspace?")
     db.append_message(plain, "assistant", content="A report and two references.",
                       token_count=11, finish_reason="stop")
@@ -136,6 +138,13 @@ def adjust(db_path: Path, ids: dict, workspace: Path) -> None:
         )
         conn.execute("INSERT OR REPLACE INTO state_meta (key, value) VALUES (?, ?)",
                      ("last_device", "machine-a"))
+        conn.execute("INSERT INTO gateway_hygiene_state VALUES ('telegram:42', 3)")
+        conn.execute("INSERT INTO conversation_generations VALUES ('telegram', 'telegram:42', 2)")
+        conn.execute("INSERT INTO gateway_heartbeats VALUES ('backend-a', 123, 1, 2, 'coder', 'machine-a')")
+        conn.execute("INSERT INTO session_turn_leases VALUES (?, 'machine-a', 1, 100)",
+                     (ids["plain"],))
+        conn.execute("UPDATE sessions SET compression_ineffective_count = 3, "
+                     "compression_recovery_deadline = 100, git_metadata_generation = 7")
         conn.commit()
     finally:
         conn.close()
@@ -164,13 +173,14 @@ def record(db_path: Path, ids: dict, workspace: Path) -> dict:
             "reasoning, api_content, active, compacted FROM messages ORDER BY id")]
         return {
             "generatedBy": "scripts/generate_hermes_fixture.py",
-            "hermesVersion": "0.19.0",
+            "hermesVersion": "0.21.3",
             "schemaVersion": version,
-            "adapterId": "hermes-0.19-sqlite22-v1",
+            "adapterId": "hermes-0.21-sqlite30-v1",
             "tables": tables,
             "durableTables": list(DURABLE_TABLES),
             "runtimeTables": [t for t in RUNTIME_TABLES if t in tables],
             "columns": columns,
+            "systemPrompts": [dict(r) for r in conn.execute("SELECT * FROM system_prompts ORDER BY hash")],
             "scenarios": ids,
             "workspace": str(workspace),
             "sessions": sessions,
@@ -182,7 +192,7 @@ def record(db_path: Path, ids: dict, workspace: Path) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--out", default="tests/fixtures/hermes_0_19_0_schema22.json")
+    ap.add_argument("--out", default="tests/fixtures/hermes_0_21_3_schema30.json")
     ap.add_argument("--keep", action="store_true", help="keep the temporary home")
     args = ap.parse_args()
 
@@ -194,7 +204,8 @@ def main() -> int:
     isolate(home)
 
     from hermes_constants import get_hermes_home
-    from hermes_state import SCHEMA_VERSION, SessionDB
+    from hermes_state import SessionDB
+    from hermes_state_common import SCHEMA_VERSION
 
     resolved = Path(get_hermes_home())
     if resolved != home.resolve():

@@ -21,11 +21,11 @@ from pathlib import Path
 
 import pytest
 
-FIXTURE = Path(__file__).parent / "fixtures" / "hermes_0_19_0_schema22.json"
+FIXTURE = Path(__file__).parent / "fixtures" / "hermes_0_21_3_schema30.json"
 
-PINNED_HERMES_VERSION = "0.19.0"
-PINNED_SCHEMA_VERSION = 22
-ADAPTER_ID = "hermes-0.19-sqlite22-v1"
+PINNED_HERMES_VERSION = "0.21.3"
+PINNED_SCHEMA_VERSION = 30
+ADAPTER_ID = "hermes-0.21-sqlite30-v1"
 
 # How the launcher's options translate to the pinned Hermes CLI. Verified
 # against the installed parser rather than assumed, because a rename upstream
@@ -61,7 +61,9 @@ REQUIRED_SESSION_COLUMNS = {
 }
 # Tables the adapter empties, because they describe one machine's live state.
 RUNTIME_TABLES = {
-    "state_meta", "gateway_routing", "compression_locks", "async_delegations",
+    "gateway_routing", "compression_locks", "async_delegations",
+    "gateway_hygiene_state", "conversation_generations", "gateway_heartbeats",
+    "session_turn_leases",
 }
 
 # Live checks need the real package; probe by import name so a partially
@@ -103,7 +105,7 @@ class TestRecordedContract:
         assert fixture["adapterId"] == ADAPTER_ID
 
     def test_durable_tables_are_the_ones_that_carry_a_conversation(self, fixture):
-        assert fixture["durableTables"] == ["sessions", "messages", "session_model_usage"]
+        assert fixture["durableTables"] == ["sessions", "messages", "session_model_usage", "system_prompts"]
         for table in fixture["durableTables"]:
             assert table in fixture["tables"]
 
@@ -172,9 +174,9 @@ class TestLivePackage:
     """These fail if the installed package drifts from the recorded contract."""
 
     def test_schema_version_still_matches(self):
-        import hermes_state
+        from hermes_state_common import SCHEMA_VERSION
 
-        assert hermes_state.SCHEMA_VERSION == PINNED_SCHEMA_VERSION
+        assert SCHEMA_VERSION == PINNED_SCHEMA_VERSION
 
     def test_memory_entry_delimiter_still_matches(self):
         from tools.memory_tool import ENTRY_DELIMITER
@@ -192,7 +194,7 @@ class TestLivePackage:
 
         assert DEFAULT_CONFIG["model"] == ""
         assert DEFAULT_CONFIG["toolsets"] == ["hermes-cli"]
-        assert DEFAULT_CONFIG["agent"]["max_turns"] == 90
+        assert DEFAULT_CONFIG["agent"]["max_turns"] is None
         memory = DEFAULT_CONFIG["memory"]
         assert memory["memory_enabled"] is True
         assert memory["user_profile_enabled"] is True

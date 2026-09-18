@@ -49,6 +49,9 @@ if enabled:
     assert "hermes-pubky agent init default" in help_text
     assert "hermes-pubky run default" in help_text
     assert "does not sync the current Hermes profile" in help_text
+    assert "conversation database snapshots" in help_text
+    assert "portable configuration" in help_text
+    assert "remote Pubky homeserver" in help_text
 else:
     assert handler is None
 # Loading the companion must not import the provider, native SDK or launcher.

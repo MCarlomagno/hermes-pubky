@@ -30,14 +30,16 @@ from hermes_pubky.supervisor import Supervisor
 
 OWNER = "8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo"
 
-# A schema-22-shaped conversation database: what the adapter checks for,
+# A schema-30-shaped conversation database: what the adapter checks for,
 # nothing Hermes-specific beyond that.
 SCHEMA = """
 CREATE TABLE schema_version (version INTEGER);
-INSERT INTO schema_version VALUES (22);
+INSERT INTO schema_version VALUES (30);
 CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT);
 CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT);
 CREATE TABLE session_model_usage (id INTEGER PRIMARY KEY, session_id TEXT);
+CREATE TABLE system_prompts (hash TEXT PRIMARY KEY, prompt TEXT);
+CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
 # Stands in for Hermes: one turn appends to MEMORY.md and records a message.
@@ -142,7 +144,7 @@ def other(tmp_path, remote, fake_hermes):
 @pytest.fixture
 def fake_hermes(monkeypatch):
     """No Hermes installed: the runtime check passes and the child is ours."""
-    monkeypatch.setattr(adapter, "assert_supported_runtime", lambda: "0.19.0")
+    monkeypatch.setattr(adapter, "assert_supported_runtime", lambda: "0.21.3")
     launches = []
 
     def launch_command(**kwargs):

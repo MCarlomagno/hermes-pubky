@@ -21,22 +21,35 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
+from .hermes_adapter import SUPPORTED_DB_SCHEMA
 from .models import DATABASE_PATH, FileRecord, SchemaError
 from .objects import ObjectCache, assemble, stage_file
 from .paths import Layout
 
 logger = logging.getLogger("hermes_pubky.database")
 
-SUPPORTED_SCHEMA = 22
+SUPPORTED_SCHEMA = SUPPORTED_DB_SCHEMA
+LEGACY_SCHEMA = 22
 WORKSPACE_MARKER = "pubky-workspace:"
 
 # Durable tables whose rows are the conversation.
-DURABLE_TABLES = ("sessions", "messages", "session_model_usage")
+DURABLE_TABLES = ("sessions", "messages", "session_model_usage", "system_prompts")
 
 # Tables describing one machine's live state. Emptied in the snapshot only.
 RUNTIME_TABLES = (
-    "gateway_routing", "compression_locks", "async_delegations", "state_meta",
+    "gateway_routing", "compression_locks", "async_delegations",
     "telegram_dm_topic_bindings", "telegram_dm_topic_mode",
+    "gateway_hygiene_state", "conversation_generations", "gateway_heartbeats",
+    "session_turn_leases",
+)
+
+# These describe the copied search indexes, not the source machine. In
+# particular, dropping rebuild progress can make partially indexed history
+# disappear from search. Everything else in state_meta stays local.
+PORTABLE_META_KEYS = (
+    "fts_storage_version", "fts_optimize_available", "fts_stale",
+    "fts_rebuild_high_water", "fts_rebuild_progress", "fts_rebuild_deferral",
+    "fts_cjk_stale", "fts_cjk_rebuild_high_water", "fts_cjk_rebuild_progress",
 )
 
 # Session columns that name a live channel or this device.
@@ -44,16 +57,17 @@ CLEARED_SESSION_COLUMNS = (
     "session_key", "chat_id", "chat_type", "thread_id", "display_name",
     "origin_json", "profile_name", "handoff_state", "handoff_platform",
     "handoff_error", "compression_failure_error", "model_config",
-    "billing_base_url",
+    "billing_base_url", "compression_recovery_deadline",
 )
 ZEROED_SESSION_COLUMNS = (
     "expiry_finalized", "compression_fallback_streak",
-    "compression_failure_cooldown_until",
+    "compression_failure_cooldown_until", "compression_ineffective_count",
+    "git_metadata_generation",
 )
 
 # Application tables this adapter knows about. Anything else requires an
 # explicit decision rather than being uploaded by default.
-KNOWN_TABLES = set(DURABLE_TABLES) | set(RUNTIME_TABLES) | {"schema_version"}
+KNOWN_TABLES = set(DURABLE_TABLES) | set(RUNTIME_TABLES) | {"schema_version", "state_meta"}
 
 
 class UnsupportedDatabase(SchemaError):
@@ -77,6 +91,7 @@ class StagedDatabase:
 
     path: Path
     digest: str
+    migrated: bool = False
 
 
 def capture_database(layout: Layout, cache: ObjectCache) -> Optional[CapturedDatabase]:
@@ -97,7 +112,7 @@ def capture_database(layout: Layout, cache: ObjectCache) -> Optional[CapturedDat
     working = staging / "state.sqlite3"
 
     copy_database(source, working)
-    _assert_supported(working)
+    _prepare_database(working)
     _normalize(working, layout)
     _verify_integrity(working)
     digest = logical_digest(working)
@@ -135,7 +150,7 @@ def copy_database(source: Path, destination: Path) -> None:
         origin.close()
 
 
-def _assert_supported(path: Path) -> None:
+def _assert_supported(path: Path, *, allow_legacy: bool = False) -> int:
     """Refuse a schema this adapter has not been validated against."""
     conn = sqlite3.connect(path)
     try:
@@ -144,7 +159,7 @@ def _assert_supported(path: Path) -> None:
         except sqlite3.Error as exc:
             raise UnsupportedDatabase(
                 f"{path} has no schema_version table ({exc})") from exc
-        if version != SUPPORTED_SCHEMA:
+        if version != SUPPORTED_SCHEMA and not (allow_legacy and version == LEGACY_SCHEMA):
             raise UnsupportedDatabase(
                 f"conversation schema {version} is not supported; this adapter "
                 f"targets {SUPPORTED_SCHEMA}. Working state was not modified.")
@@ -152,6 +167,8 @@ def _assert_supported(path: Path) -> None:
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name NOT LIKE 'sqlite_%'")}
         for table in DURABLE_TABLES:
+            if version == LEGACY_SCHEMA and table == "system_prompts":
+                continue
             if table not in present:
                 raise UnsupportedDatabase(f"required table {table} is missing")
         unknown = {t for t in present
@@ -160,8 +177,42 @@ def _assert_supported(path: Path) -> None:
             raise UnsupportedDatabase(
                 f"unrecognized tables {sorted(unknown)}; an adapter decision is "
                 "needed before uploading them")
+        return version
     finally:
         conn.close()
+
+
+def _prepare_database(path: Path) -> bool:
+    """Upgrade only a staged schema-22 copy with Hermes' own migrations.
+
+    Reject unknown schemas/tables and corrupt input before opening a writable
+    Hermes handle: its repair machinery must never turn bad input into a
+    seemingly successful restore. The source working copy and remote objects
+    are untouched if any step fails.
+    """
+    version = _assert_supported(path, allow_legacy=True)
+    _verify_integrity(path)
+    if version == SUPPORTED_SCHEMA:
+        return False
+    from .hermes_adapter import assert_supported_runtime
+
+    assert_supported_runtime()
+    try:
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=path)
+        db.close()
+        # Publish/install a self-contained database, never an unshipped WAL.
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE")
+        finally:
+            conn.close()
+        _assert_supported(path)
+        _verify_integrity(path)
+    except Exception as exc:
+        raise UnsupportedDatabase(f"conversation upgrade failed: {exc}") from exc
+    return True
 
 
 def _normalize(path: Path, layout: Layout) -> None:
@@ -175,6 +226,9 @@ def _normalize(path: Path, layout: Layout) -> None:
         for table in RUNTIME_TABLES:
             if table in present:
                 conn.execute(f"DELETE FROM {table}")
+        placeholders = ",".join("?" for _ in PORTABLE_META_KEYS)
+        conn.execute(f"DELETE FROM state_meta WHERE key NOT IN ({placeholders})",
+                     PORTABLE_META_KEYS)
 
         columns = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
         for column in CLEARED_SESSION_COLUMNS:
@@ -193,6 +247,8 @@ def _normalize(path: Path, layout: Layout) -> None:
             for row in conn.execute(
                     f"SELECT id, {column} FROM sessions WHERE {column} IS NOT NULL"):
                 session_id, value = row
+                if value.startswith(WORKSPACE_MARKER):
+                    continue  # A legacy remote snapshot is already normalized.
                 if value == workspace:
                     replacement = f"{WORKSPACE_MARKER}/"
                 elif value.startswith(workspace + "/"):
@@ -241,7 +297,9 @@ def logical_digest(path: Path) -> str:
             if not columns:
                 continue
             names = ", ".join(f'"{c}"' for c in columns)
-            key = "id" if "id" in columns else columns[0]
+            # Usage rows have a composite key; ordering by session_id alone
+            # makes an identical database's digest depend on insertion order.
+            key = "id" if "id" in columns else names
             digest.update(f"table:{table}:{names}\n".encode("utf-8"))
             for row in conn.execute(f"SELECT {names} FROM {table} ORDER BY {key}"):
                 digest.update(repr(row).encode("utf-8"))
@@ -262,15 +320,22 @@ def stage_database(record: FileRecord, resolve: Callable[[str], Path],
     staging.mkdir(parents=True, exist_ok=True)
     candidate = staging / "state.db"
 
+    # A failed migration may have left a WAL beside an earlier candidate.
+    # It must never be replayed against the next assembled snapshot.
+    for suffix in ("-wal", "-shm"):
+        candidate.with_name(candidate.name + suffix).unlink(missing_ok=True)
     # assemble() verifies each chunk and the whole-file hash.
     assemble(record, resolve, candidate)
-    _assert_supported(candidate)
-    _verify_integrity(candidate)
+    _assert_supported(candidate, allow_legacy=True)
     # The digest is taken before rebasing, on the same bytes the other machine
     # digested when it captured them.
     digest = logical_digest(candidate)
+    migrated = _prepare_database(candidate)
+    if migrated:
+        _normalize(candidate, layout)
+        _verify_integrity(candidate)
     _rebase(candidate, layout)
-    return StagedDatabase(path=candidate, digest=digest)
+    return StagedDatabase(path=candidate, digest=digest, migrated=migrated)
 
 
 def install_database(staged: StagedDatabase, layout: Layout) -> None:

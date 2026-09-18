@@ -28,19 +28,23 @@ anything else machine-specific.
 ## Install
 
 ```bash
-uv pip install hermes-pubky==0.2.1 "hermes-agent==0.19.0"
+uv pip install hermes-pubky==0.2.2
 hermes-pubky agent init default
 hermes-pubky run default
 ```
 
-Needs Python 3.11–3.13, Hermes 0.19.0 exactly, and a Pubky homeserver on v0.11
-or later. `agent init` asks Pubky Ring to authorize one scoped capability, then
+Run these commands in your activated Hermes environment. Needs Python 3.11–3.13,
+Hermes 0.21.3 with conversation schema 30, and a Pubky homeserver on v0.11
+or later. This release was verified against Hermes commit
+`a51143fbbe6ddbc0c7f403d0579c4d75504c6793`; use that checkout as described
+under Development below. Hermes is distributed from source, not through PyPI.
+`agent init` asks Pubky Ring to authorize one scoped capability, then
 publishes the agent's first checkpoint.
 
 On a second computer:
 
 ```bash
-uv pip install hermes-pubky==0.2.1 "hermes-agent==0.19.0"
+uv pip install hermes-pubky==0.2.2
 hermes-pubky agent attach pubky://<owner>/priv/hermes.pubky.app/v2/agents/default/head.json
 hermes-pubky run default
 ```
@@ -65,16 +69,31 @@ hermes plugins install MCarlomagno/hermes-pubky/plugin
 hermes plugins enable hermes-pubky
 ```
 
-Hermes 0.19.0 only copies the plugin directory; it does not install its Python
-dependencies automatically. Use the pip installation above in that environment.
-Newer installers can read `plugin/pyproject.toml`, but the managed launcher
-still requires Hermes 0.19.0 exactly. Use a separate environment if needed.
+Current Hermes installers install the pinned dependency from
+`plugin/pyproject.toml` into the Hermes environment. If dependency installation
+is disabled or fails, install it explicitly with the pip command above.
 The installer also displays [setup instructions](plugin/after-install.md).
 
-For a catalog submission, set `subdir: plugin` and `requires_hermes: "==0.19.0"`.
+The catalog entry is a **setup helper**. Running a managed agent syncs its
+instructions, memories, skills, conversation database snapshots, portable
+configuration, and workspace to your remote Pubky homeserver. The homeserver
+operator can read that data; it is not end-to-end encrypted.
+
+For a catalog submission, set `subdir: plugin` and `requires_hermes: "==0.21.3"`.
 Keep the wrapper's manifest version, project version, and exact package
 dependency aligned with the published release. The wrapper never downloads or
 updates code at import time.
+
+### Upgrading an existing agent
+
+Stop the agent and sync its latest work with the old runtime before upgrading.
+Install hermes-pubky 0.2.2 in the verified Hermes 0.21.3 environment on every
+computer that runs the agent. Schema-22 conversations from Hermes 0.19.0 are
+upgraded using Hermes' own migrations on a staged copy during capture or restore.
+The next checkpoint saves schema 30; old checkpoints remain in history.
+An upgrade failure leaves the working database unchanged. Other unverified
+schemas are refused. After the new checkpoint is saved, use the newer runtime
+on every device; hermes-pubky 0.2.1 cannot read schema 30.
 
 ## Commands
 
@@ -155,7 +174,8 @@ homeserver quota. Removing a file drops it from the current inventory, not from
 history; this is not secure erasure.
 
 Not in 0.2: multi-device merge, client-side encryption, portable credentials,
-semantic retrieval, Windows wheels, and harnesses other than Hermes 0.19.0.
+semantic retrieval, Windows wheels, and harnesses other than the verified
+Hermes 0.21.3 runtime.
 
 ## How it fits together
 
@@ -193,7 +213,9 @@ is readable there. Files over 1 MiB, and the database always, are split into
 
 ```bash
 uv venv --python 3.11 .venv
-uv pip install --python .venv/bin/python maturin pytest "hermes-agent==0.19.0"
+git clone https://github.com/NousResearch/hermes-agent.git /tmp/hermes-pubky-runtime
+git -C /tmp/hermes-pubky-runtime checkout a51143fbbe6ddbc0c7f403d0579c4d75504c6793
+uv pip install --python .venv/bin/python maturin pytest -e /tmp/hermes-pubky-runtime
 PYO3_PYTHON="$PWD/.venv/bin/python" .venv/bin/maturin develop
 
 .venv/bin/pytest        # Python tests; the Hermes ones skip if it is absent
@@ -225,6 +247,13 @@ needed:
 python scripts/check_managed_hermes_integration.py
 ```
 
+Verify the catalog wrapper in a fresh environment using the candidate wheel:
+
+```bash
+maturin build --release --out dist
+python scripts/check_plugin_install.py --hermes-source /tmp/hermes-pubky-runtime --wheel-dir dist
+```
+
 The full recovery scenario through the shipped command line, one agent across
 two machines, ending with the grant revoked (so each run needs a fresh fixture):
 
@@ -238,7 +267,7 @@ with tests to match:
 
 | | |
 | --- | --- |
-| Hermes | `hermes-agent==0.19.0`, conversation schema 22 |
+| Hermes | Hermes 0.21.3 at the verified commit above, conversation schema 30 |
 | Pubky SDK | v0.11.0 commit `6a14bdb8fa2e30ef4e4b241fcdd3992c453d2378` |
 
 `Cargo.lock` is committed. `tests/test_hermes_contract.py` holds the upstream

@@ -181,7 +181,7 @@ class Layout:
 
     @property
     def memories_dir(self) -> Path:
-        # Hermes 0.19 keeps these in a subdirectory, not at the home root.
+        # Hermes keeps these in a subdirectory, not at the home root.
         return self.hermes_home / "memories"
 
     @property

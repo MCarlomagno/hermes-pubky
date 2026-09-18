@@ -36,6 +36,7 @@ from .database import (
     stage_database,
 )
 from .journal import (
+    BASE_DB_STAT,
     LAST_SESSION,
     REQUEST_DONE,
     REQUEST_FAILED,
@@ -335,6 +336,10 @@ class Supervisor:
         if staged is not None:
             install_database(staged, self.layout)
         projection.set_base(snapshot, db_digest=staged.digest if staged else None)
+        if staged is not None and staged.migrated:
+            # The installed schema is newer than the snapshot. Force the next
+            # capture to publish it even if the user has not sent a turn yet.
+            self.journal.set_setting(BASE_DB_STAT, None)
         # The generated configuration describes the base; keep it in step so
         # the next capture reads the installed settings back, not stale ones.
         self._render_runtime(self._portable_from(snapshot))

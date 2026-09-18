@@ -284,7 +284,7 @@ def plan_import(source: Optional[Path], workspace: Optional[Path]) -> ImportPlan
     for legacy in ("USER.md", "MEMORY.md"):
         if (source / legacy).is_file():
             plan.excluded.append(
-                (legacy, "root-level memory is not the pinned 0.19 layout"))
+                (legacy, "root-level memory is not the supported Hermes layout"))
 
     skills = source / "skills"
     if skills.is_dir():

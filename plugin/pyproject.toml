@@ -3,6 +3,6 @@
 # merely because a newer package was published to PyPI.
 [project]
 name = "hermes-pubky-plugin"
-version = "0.2.1"
+version = "0.2.2"
 requires-python = ">=3.11,<3.14"
-dependencies = ["hermes-pubky==0.2.1"]
+dependencies = ["hermes-pubky==0.2.2"]

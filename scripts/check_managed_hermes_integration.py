@@ -16,6 +16,7 @@ The A-to-B handoff script covers the same flow against a live homeserver.
 
 from __future__ import annotations
 
+import gzip
 import json
 import shutil
 import sqlite3
@@ -160,6 +161,35 @@ def main() -> int:
         with Journal(layout.journal_file) as journal:
             check("restoring did not disturb the pending checkpoints",
                   len(journal.active_checkpoints()) == len(pending))
+
+        resumed = Supervisor(layout, network="testnet").run(
+            resume=session_id, query="Continue this conversation.", offline=True)
+        check("the restored conversation resumes in real Hermes",
+              resumed.exit_code == EXIT_SAVED_LOCALLY and resumed.child_exit_code == 0,
+              resumed.detail)
+        check("the resumed conversation preserves the earlier reply",
+              len(assistant_messages(layout.state_db)) == 2)
+
+        # Exercise upgrade through the real launcher, not only the DB adapter.
+        legacy = Layout(root=root, network="testnet", owner=owner,
+                        agent_id="legacy").ensure()
+        fixture = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / \
+            "hermes_0_19_0_schema22.sqlite3.gz"
+        legacy.state_db.write_bytes(gzip.decompress(fixture.read_bytes()))
+        write_private(legacy.soul_file, b"# Legacy test agent\n")
+        write_private(legacy.user_memory_file, b"")
+        write_private(legacy.agent_memory_file, b"")
+        write_private(legacy.agents_md, b"# Workspace\n")
+        legacy.device_config_file.write_text(yaml.safe_dump(model.device_config()))
+        write_env_file(legacy.secrets_file, {"FAKE_MODEL_KEY": "not-a-real-key"})
+        old_replies = assistant_messages(legacy.state_db)
+        upgraded = Supervisor(legacy, network="testnet").run(
+            resume="a" * 32, query="Continue after upgrading.", offline=True)
+        check("a Hermes 0.19 conversation upgrades and resumes in real Hermes",
+              upgraded.exit_code == EXIT_SAVED_LOCALLY and upgraded.child_exit_code == 0,
+              upgraded.detail)
+        check("upgrading preserves all earlier assistant replies",
+              assistant_messages(legacy.state_db) == old_replies + [REPLY])
 
     check("the caller's real profile was never touched",
           not (real_home / "plugins" / "pubky").exists()

@@ -5,7 +5,7 @@ the configuration shape, the conversation database and the discovery bridge, so
 supporting another harness later means adding a sibling rather than untangling
 the launcher.
 
-Verified against `hermes-agent==0.19.0`, conversation schema 22. See
+Verified against Hermes 0.21.3, conversation schema 30. See
 `tests/test_hermes_contract.py`, which fails if the installed package drifts.
 
 Reference: implementation plan sections 8 and 9.
@@ -19,10 +19,13 @@ from typing import Any, Dict, List, Optional
 from .models import PortableConfig, RuntimeInfo, SchemaError
 from .paths import Layout, write_private
 
-ADAPTER_ID = "hermes-0.19-sqlite22-v1"
+ADAPTER_ID = "hermes-0.21-sqlite30-v1"
 RUNTIME_NAME = "hermes"
-SUPPORTED_HERMES = "0.19.0"
-SUPPORTED_DB_SCHEMA = 22
+SUPPORTED_HERMES = "0.21.3"
+SUPPORTED_DB_SCHEMA = 30
+# Hermes is distributed from source. Keep CI and the documented checkout on
+# this revision; a version string alone does not identify a main-branch build.
+VERIFIED_HERMES_COMMIT = "a51143fbbe6ddbc0c7f403d0579c4d75504c6793"
 
 # Hermes separates memory entries with this exact delimiter. Files are stored
 # and restored byte-for-byte; this exists for previews and counts only.
@@ -74,12 +77,19 @@ def assert_supported_runtime() -> str:
     found = installed_hermes_version()
     if found is None:
         raise SchemaError(
-            "hermes-agent is not installed in this environment; install "
-            f"hermes-agent=={SUPPORTED_HERMES} beside hermes-pubky")
+            "Hermes is not installed in this environment; install hermes-pubky "
+            f"in the verified Hermes {SUPPORTED_HERMES} environment (see README)")
     if found != SUPPORTED_HERMES:
         raise SchemaError(
             f"this release supports hermes-agent {SUPPORTED_HERMES}, found "
             f"{found}. Another version needs explicit adapter validation.")
+    from hermes_state_common import SCHEMA_VERSION
+
+    if SCHEMA_VERSION != SUPPORTED_DB_SCHEMA:
+        raise SchemaError(
+            f"this Hermes build uses conversation schema {SCHEMA_VERSION}; "
+            f"expected {SUPPORTED_DB_SCHEMA}. Use Hermes commit "
+            f"{VERIFIED_HERMES_COMMIT}.")
     return found
 
 

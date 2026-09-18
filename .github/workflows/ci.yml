@@ -13,7 +13,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
-  HERMES_VERSION: "0.19.0"
+  HERMES_COMMIT: "a51143fbbe6ddbc0c7f403d0579c4d75504c6793"
 
 jobs:
   rust:
@@ -104,13 +104,20 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+      - uses: actions/checkout@v5
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ env.HERMES_COMMIT }}
+          path: .hermes-runtime
       - name: Install the pinned Hermes beside the package
         run: |
-          uv pip install --system maturin pytest "hermes-agent==${HERMES_VERSION}"
+          uv pip install --system maturin pytest -e .hermes-runtime
           maturin build --release --out dist
           uv pip install --system dist/*.whl
       - name: Upstream contract and conversation fixtures
         run: pytest tests/test_hermes_contract.py tests/test_database.py tests/test_plugin_distribution.py -q
+      - name: Fresh wrapper install and catalog admission
+        run: python scripts/check_plugin_install.py --hermes-source .hermes-runtime --wheel-dir dist
       - name: Launch a real managed Hermes turn
         run: python scripts/check_managed_hermes_integration.py
 
@@ -142,9 +149,14 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+      - uses: actions/checkout@v5
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ env.HERMES_COMMIT }}
+          path: .hermes-runtime
       - name: Install everything the acceptance test needs
         run: |
-          uv pip install --system maturin "hermes-agent==${HERMES_VERSION}"
+          uv pip install --system maturin -e .hermes-runtime
           maturin build --release --out dist
           uv pip install --system dist/*.whl
       - name: Build the testnet fixture

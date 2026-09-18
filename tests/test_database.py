@@ -7,6 +7,7 @@ history; what must not is one machine's live channel state.
 
 from __future__ import annotations
 
+import gzip
 import shutil
 import sqlite3
 import subprocess
@@ -16,13 +17,18 @@ from pathlib import Path
 import pytest
 
 from hermes_pubky.database import (
+    PORTABLE_META_KEYS,
+    RUNTIME_TABLES,
+    SUPPORTED_SCHEMA,
     WORKSPACE_MARKER,
     UnsupportedDatabase,
     capture_database,
     logical_digest,
     restore_database,
+    stage_database,
 )
-from hermes_pubky.objects import ObjectCache
+from hermes_pubky.models import DATABASE_PATH
+from hermes_pubky.objects import ObjectCache, stage_file
 from hermes_pubky.paths import Layout
 
 OWNER = "8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo"
@@ -82,6 +88,11 @@ class TestCapture:
         source = build_real_database(tmp_path)
         shutil.copy2(source, layout.state_db)
         before = _durable_rows(layout.state_db)
+        original = sqlite3.connect(layout.state_db)
+        try:
+            all_messages = original.execute("SELECT * FROM messages ORDER BY id").fetchall()
+        finally:
+            original.close()
 
         capture_database(layout, ObjectCache(layout.cached_objects))
         working = layout.staging / "database" / "state.sqlite3"
@@ -90,6 +101,11 @@ class TestCapture:
         assert before["messages"] == after["messages"], \
             "message rows, order and flags must be untouched"
         assert len(before["sessions"]) == len(after["sessions"])
+        normalized = sqlite3.connect(working)
+        try:
+            assert normalized.execute("SELECT * FROM messages ORDER BY id").fetchall() == all_messages
+        finally:
+            normalized.close()
 
     def test_machine_specific_session_state_is_cleared(self, tmp_path):
         layout = make_layout(tmp_path)
@@ -105,7 +121,15 @@ class TestCapture:
                 "FROM sessions WHERE session_key IS NOT NULL "
                 "OR chat_id IS NOT NULL").fetchone()
             assert row is None, f"live channel state survived: {row}"
-            assert conn.execute("SELECT COUNT(*) FROM state_meta").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM sessions WHERE "
+                                "compression_recovery_deadline IS NOT NULL OR "
+                                "compression_ineffective_count != 0 OR "
+                                "git_metadata_generation != 0").fetchone()[0] == 0
+            keys = {r[0] for r in conn.execute("SELECT key FROM state_meta")}
+            assert keys <= set(PORTABLE_META_KEYS)
+            for table in RUNTIME_TABLES:
+                if conn.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (table,)).fetchone():
+                    assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
         finally:
             conn.close()
 
@@ -199,6 +223,44 @@ class TestLogicalDigest:
 
 @live
 class TestRestore:
+    def test_system_prompts_and_search_survive(self, tmp_path):
+        from hermes_state import SessionDB
+
+        layout = make_layout(tmp_path)
+        shutil.copy2(build_real_database(tmp_path), layout.state_db)
+        captured = capture_database(layout, ObjectCache(layout.cached_objects))
+        restore_database(captured.record, captured.objects.__getitem__, layout)
+        db = SessionDB(db_path=layout.state_db)
+        try:
+            session = db.get_session("a" * 32)
+            assert session["system_prompt"] == "Synthetic system prompt for portability tests."
+            assert db.search_messages("report")
+        finally:
+            db.close()
+
+    def test_search_rebuild_metadata_survives_but_device_metadata_does_not(self, tmp_path):
+        layout = make_layout(tmp_path)
+        shutil.copy2(build_real_database(tmp_path), layout.state_db)
+        conn = sqlite3.connect(layout.state_db)
+        try:
+            conn.executemany("INSERT OR REPLACE INTO state_meta VALUES (?, ?)", [
+                ("fts_rebuild_high_water", "9"), ("fts_rebuild_progress", "4"),
+                ("device_secret", "must not travel"),
+            ])
+            conn.commit()
+        finally:
+            conn.close()
+        captured = capture_database(layout, ObjectCache(layout.cached_objects))
+        restore_database(captured.record, captured.objects.__getitem__, layout)
+        conn = sqlite3.connect(layout.state_db)
+        try:
+            meta = dict(conn.execute("SELECT key, value FROM state_meta"))
+        finally:
+            conn.close()
+        assert meta["fts_rebuild_high_water"] == "9"
+        assert meta["fts_rebuild_progress"] == "4"
+        assert "device_secret" not in meta
+
     def test_a_round_trip_preserves_the_conversation(self, tmp_path):
         layout = make_layout(tmp_path)
         shutil.copy2(build_real_database(tmp_path), layout.state_db)
@@ -330,6 +392,106 @@ class TestCopy:
             assert copied.execute("SELECT COUNT(*) FROM proof").fetchone()[0] == 1
         finally:
             copied.close()
+
+
+def legacy_database(tmp_path: Path) -> Path:
+    fixture = Path(__file__).parent / "fixtures" / "hermes_0_19_0_schema22.sqlite3.gz"
+    path = tmp_path / "legacy.db"
+    path.write_bytes(gzip.decompress(fixture.read_bytes()))
+    return path
+
+
+@live
+class TestLegacyMigration:
+    def test_install_seals_the_upgrade_without_needing_a_new_turn(self, tmp_path):
+        from hermes_pubky.journal import new_id, utcnow
+        from hermes_pubky.models import RuntimeInfo, Snapshot
+        from hermes_pubky.supervisor import Supervisor
+
+        layout = make_layout(tmp_path)
+        staged = stage_file(legacy_database(tmp_path), DATABASE_PATH,
+                            tmp_path / "objects", force_chunked=True)
+        supervisor = Supervisor(layout, network="testnet")
+        for reference, path in staged.objects.items():
+            supervisor.cache.adopt(reference, path)
+        old = Snapshot(agent_id="default", snapshot_id=new_id(), created_at=utcnow(),
+                       device_id="f" * 32,
+                       runtime=RuntimeInfo("hermes", "0.19.0", "hermes-0.19-sqlite22-v1"),
+                       files={DATABASE_PATH: staged.record})
+        with supervisor.session() as s:
+            s.install(old)
+            candidate = s.seal()
+            assert candidate is not None
+            assert candidate.snapshot.parent.snapshot_id == old.snapshot_id
+            assert candidate.snapshot.files[DATABASE_PATH].sha256 != staged.record.sha256
+            assert candidate.snapshot.runtime.version == "0.21.3"
+            assert s.seal() is None, "an unchanged upgraded agent must not create more checkpoints"
+
+    def test_capture_upgrades_a_copy_and_preserves_the_source(self, tmp_path):
+        layout = make_layout(tmp_path)
+        shutil.copy2(legacy_database(tmp_path), layout.state_db)
+        original = layout.state_db.read_bytes()
+        before = _durable_rows(layout.state_db)
+        captured = capture_database(layout, ObjectCache(layout.cached_objects))
+        assert layout.state_db.read_bytes() == original
+        restore_database(captured.record, captured.objects.__getitem__, layout)
+        assert _durable_rows(layout.state_db) == before
+        self.assert_upgraded(layout.state_db)
+
+    def test_restore_upgrades_a_legacy_remote_snapshot(self, tmp_path):
+        layout = make_layout(tmp_path)
+        source = legacy_database(tmp_path)
+        original = source.read_bytes()
+        staged = stage_file(source, DATABASE_PATH, tmp_path / "objects", force_chunked=True)
+        candidate = stage_database(staged.record, staged.objects.__getitem__, layout)
+        assert candidate.migrated
+        assert candidate.digest != logical_digest(candidate.path)
+        assert source.read_bytes() == original
+        assert _durable_rows(candidate.path) == _durable_rows(source)
+        self.assert_upgraded(candidate.path)
+
+    @pytest.mark.parametrize("failure", ["migration", "future_schema", "foreign_key"])
+    def test_failed_upgrade_does_not_replace_working_state(self, tmp_path, monkeypatch, failure):
+        import hermes_state
+
+        layout = make_layout(tmp_path)
+        shutil.copy2(build_real_database(tmp_path), layout.state_db)
+        original = layout.state_db.read_bytes()
+        source = legacy_database(tmp_path)
+        conn = sqlite3.connect(source)
+        try:
+            if failure == "future_schema":
+                conn.execute("UPDATE schema_version SET version = 99")
+            elif failure == "foreign_key":
+                conn.execute("UPDATE messages SET session_id = 'missing'")
+            conn.commit()
+        finally:
+            conn.close()
+        if failure == "migration":
+            def fail(**kwargs):
+                raise RuntimeError("migration interrupted")
+            monkeypatch.setattr(hermes_state, "SessionDB", fail)
+        staged = stage_file(source, DATABASE_PATH, tmp_path / "objects", force_chunked=True)
+        with pytest.raises(UnsupportedDatabase):
+            restore_database(staged.record, staged.objects.__getitem__, layout)
+        assert layout.state_db.read_bytes() == original
+
+    @staticmethod
+    def assert_upgraded(path):
+        from hermes_state import SessionDB
+
+        conn = sqlite3.connect(path)
+        try:
+            assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == SUPPORTED_SCHEMA
+            assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        finally:
+            conn.close()
+        db = SessionDB(db_path=path)
+        try:
+            assert db.get_session("a" * 32)["system_prompt"] == "Legacy synthetic system prompt."
+            assert db.search_messages("report")
+        finally:
+            db.close()
 
 
 def _durable_rows(path: Path) -> dict:
