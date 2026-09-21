@@ -207,6 +207,21 @@ class TestLivePackage:
 
         assert version("hermes-agent") == PINNED_HERMES_VERSION
 
+    @pytest.mark.parametrize("version,schema,error", [
+        ("0.21.4", 30, "Another version needs explicit adapter validation"),
+        ("0.22.0", 30, "Another version needs explicit adapter validation"),
+        ("0.21.3", 31, "expected 30"),
+    ])
+    def test_launcher_still_refuses_unverified_runtimes(self, monkeypatch, version, schema, error):
+        import hermes_state_common
+        from hermes_pubky import hermes_adapter
+        from hermes_pubky.models import SchemaError
+
+        monkeypatch.setattr(hermes_adapter, "installed_hermes_version", lambda: version)
+        monkeypatch.setattr(hermes_state_common, "SCHEMA_VERSION", schema)
+        with pytest.raises(SchemaError, match=error):
+            hermes_adapter.assert_supported_runtime()
+
 
 @live
 class TestLaunchOptions:

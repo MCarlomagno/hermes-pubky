@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "hermes-pubky"
-version = "0.2.2"
+version = "0.2.3"
 description = "Run a Hermes agent whose saved state lives on your own Pubky homeserver"
 readme = "README.md"
 license = "MIT"

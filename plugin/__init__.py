@@ -16,7 +16,7 @@ def _setup_help(raw_args: str) -> str:
         "  hermes-pubky run <agent-id>\n\n"
         "Hermes installs the pinned launcher dependency with this helper. "
         "If dependency installation was disabled or failed, run:\n"
-        "  uv pip install hermes-pubky==0.2.2\n\n"
+        "  uv pip install hermes-pubky==0.2.3\n\n"
         "Enabling this companion does not sync the current Hermes profile. "
         "The launcher creates a dedicated profile and syncs its instructions, "
         "memories, skills, conversation database snapshots, portable "

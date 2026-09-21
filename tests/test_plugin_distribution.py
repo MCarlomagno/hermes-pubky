@@ -18,7 +18,8 @@ import yaml
     reason="hermes-agent not installed",
 )
 @pytest.mark.parametrize("enabled", [False, True])
-def test_companion_loads_without_activating_managed_state(tmp_path, enabled):
+@pytest.mark.parametrize("hermes_version", ["0.21.3", "0.21.4", "0.22.0"])
+def test_companion_loads_without_activating_managed_state(tmp_path, enabled, hermes_version):
     wrapper = Path(__file__).resolve().parents[1] / "plugin"
     home = tmp_path / "home"
     shutil.copytree(wrapper, home / "plugins" / "hermes-pubky")
@@ -34,8 +35,12 @@ def test_companion_loads_without_activating_managed_state(tmp_path, enabled):
     result = subprocess.run(
         [sys.executable, "-c", """
 import sys
+from hermes_cli import plugins_manifest
 from hermes_cli.plugins import get_plugin_manager, get_plugin_command_handler
 
+# Exercise the real loader's version gate without claiming the managed
+# runtime works on future Hermes releases.
+plugins_manifest.running_hermes_version = lambda: sys.argv[2]
 enabled = sys.argv[1] == "True"
 manager = get_plugin_manager()
 manager.discover_and_load()
@@ -57,7 +62,7 @@ else:
 # Loading the companion must not import the provider, native SDK or launcher.
 assert not any(n == "hermes_pubky" or n.startswith("hermes_pubky.")
                for n in sys.modules)
-""", str(enabled)],
+""", str(enabled), hermes_version],
         env=env, cwd=tmp_path, capture_output=True, text=True, timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr

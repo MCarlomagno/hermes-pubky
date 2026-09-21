@@ -28,7 +28,7 @@ anything else machine-specific.
 ## Install
 
 ```bash
-uv pip install hermes-pubky==0.2.2
+uv pip install hermes-pubky==0.2.3
 hermes-pubky agent init default
 hermes-pubky run default
 ```
@@ -44,7 +44,7 @@ publishes the agent's first checkpoint.
 On a second computer:
 
 ```bash
-uv pip install hermes-pubky==0.2.2
+uv pip install hermes-pubky==0.2.3
 hermes-pubky agent attach pubky://<owner>/priv/hermes.pubky.app/v2/agents/default/head.json
 hermes-pubky run default
 ```
@@ -79,7 +79,10 @@ instructions, memories, skills, conversation database snapshots, portable
 configuration, and workspace to your remote Pubky homeserver. The homeserver
 operator can read that data; it is not end-to-end encrypted.
 
-For a catalog submission, set `subdir: plugin` and `requires_hermes: "==0.21.3"`.
+For a catalog submission, set `subdir: plugin` and `requires_hermes: ">=0.21.3"`.
+The setup helper remains available on newer Hermes versions. The managed
+launcher still requires the verified Hermes 0.21.3 / schema-30 runtime and
+rejects unverified runtimes before touching agent state.
 Keep the wrapper's manifest version, project version, and exact package
 dependency aligned with the published release. The wrapper never downloads or
 updates code at import time.
@@ -87,7 +90,7 @@ updates code at import time.
 ### Upgrading an existing agent
 
 Stop the agent and sync its latest work with the old runtime before upgrading.
-Install hermes-pubky 0.2.2 in the verified Hermes 0.21.3 environment on every
+Install hermes-pubky 0.2.3 in the verified Hermes 0.21.3 environment on every
 computer that runs the agent. Schema-22 conversations from Hermes 0.19.0 are
 upgraded using Hermes' own migrations on a staged copy during capture or restore.
 The next checkpoint saves schema 30; old checkpoints remain in history.

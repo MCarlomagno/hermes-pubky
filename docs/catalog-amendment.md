@@ -1,7 +1,10 @@
-# Catalog amendment for hermes-pubky 0.2.2
+# Catalog amendment for hermes-pubky 0.2.3
 
 Addresses [the review of PR #114412](https://github.com/NousResearch/hermes-agent/pull/114412#issuecomment-5733437191).
-This is an uncommitted release candidate; 0.2.2 has not been published.
+Version 0.2.2 addressed the original review and is published. Version 0.2.3
+addresses [the follow-up review](https://github.com/NousResearch/hermes-agent/pull/114412#issuecomment-5762489178):
+the setup helper declares `requires_hermes: ">=0.21.3"` so a newer Hermes
+version does not hide `/pubky`. The launcher's strict runtime check is unchanged.
 
 ## Changes
 
@@ -20,7 +23,7 @@ This is an uncommitted release candidate; 0.2.2 has not been published.
   portable configuration, and other managed state, including homeserver
   operator access. Enabling the helper does not start syncing a normal profile.
 
-## Local validation
+## Validation from v0.2.2
 
 Validated on macOS ARM64 with Python 3.11 using the built 0.2.2 wheel and the
 upstream commit above:
@@ -34,18 +37,29 @@ upstream commit above:
   into an isolated profile, `hermes plugins validate --install-deps`, enablement,
   help command, launcher, provider import, and native extension import.
   Dependency resolution used the local candidate wheel; the scanner rated the
-  wrapper safe. Remote GitHub/PyPI installation still needs verification after
-  publication.
+  wrapper safe. A subsequent fresh GitHub installation at the v0.2.2 commit
+  resolved its pinned dependency from PyPI and passed the admission validator.
 - Rust formatting, 16 unit tests, and Clippy.
 
-CI now checks out the exact Hermes commit and repeats the managed-runtime,
-fresh-install, and testnet acceptance checks. The other Python versions and
-Linux/wheel architecture checks remain release/CI work.
+CI checks out the exact Hermes commit and repeats the managed-runtime,
+fresh-install, and testnet acceptance checks. The v0.2.2 CI and release
+workflows passed, including the Python matrix and published wheel checks.
+
+## Validation for v0.2.3
+
+- 422 Python tests passed against the built v0.2.3 wheel and verified Hermes.
+- The real plugin loader was exercised with reported Hermes versions 0.21.3,
+  0.21.4, and 0.22.0. The latter two reproduced the skipped-helper bug before
+  the manifest fix and passed afterward. These simulate the version gate;
+  they do not certify future Hermes runtimes.
+- The launcher still refuses unverified versions and database schemas.
+- Fresh wrapper installation from the candidate wheel passed the admission
+  validator, safe scanner, helper command, and provider/native import checks.
 
 ## Release and PR steps
 
 1. Review and commit the local changes, then push and let CI pass.
-2. Publish tag `v0.2.2` using the release workflow; wait for the wheels and PyPI
+2. Publish tag `v0.2.3` using the release workflow; wait for the wheels and PyPI
    package to become available.
 3. Repeat the install from GitHub in a fresh Hermes environment with no local
    wheel override. Check the pinned commit with the admission validator.
@@ -62,9 +76,9 @@ description: Setup helper for managed Pubky agents. The launcher syncs agent sta
 maintainer: MCarlomagno
 tier: community
 category: memory
-requires_hermes: "==0.21.3"
+requires_hermes: ">=0.21.3"
 docs_url: https://github.com/MCarlomagno/hermes-pubky#readme
-version: "0.2.2"
+version: "0.2.3"
 platforms:
   - linux
   - macos
@@ -77,4 +91,6 @@ capabilities:
 
 5. Rewrite the PR description for the final support requirements and helper
    behavior. Include the published-install and recovery evidence, then request
-   another review. Do not claim a broader version range until it is tested.
+   another review. Distinguish the helper's minimum Hermes version from the
+   launcher's exact runtime requirement; the broader helper range does not
+   imply managed-agent support for unverified runtimes.
