@@ -33,7 +33,7 @@ hermes-pubky agent init default
 hermes-pubky run default
 ```
 
-Run these commands in your activated Hermes environment. Needs Python 3.11–3.13,
+Run these commands in your activated Hermes environment. Needs Python 3.11–3.14,
 Hermes 0.21.3 with conversation schema 30, and a Pubky homeserver on v0.11
 or later. This release was verified against Hermes commit
 `a51143fbbe6ddbc0c7f403d0579c4d75504c6793`; use that checkout as described

@@ -5,7 +5,7 @@ pinned `hermes-pubky==0.2.3` package dependency, including the native Pubky
 extension. Current Hermes installs that dependency into its environment.
 
 The setup helper loads on Hermes 0.21.3 or later. Running a managed agent
-requires Python 3.11–3.13, Hermes 0.21.3 (schema 30), and a Pubky homeserver
+requires Python 3.11–3.14, Hermes 0.21.3 (schema 30), and a Pubky homeserver
 on v0.11 or later. The launcher rejects unverified runtimes before touching
 agent state. Use the verified Hermes checkout documented in the README.
 Release wheels support macOS and Linux; building from source requires Rust.

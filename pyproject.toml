@@ -9,7 +9,7 @@ description = "Run a Hermes agent whose saved state lives on your own Pubky home
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 authors = [{ name = "Marcos Carlomagno" }]
 keywords = ["hermes", "pubky", "agent", "portable", "homeserver"]
 classifiers = [
@@ -19,6 +19,7 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Programming Language :: Rust",
   "Topic :: Software Development :: Libraries :: Python Modules",
 ]
